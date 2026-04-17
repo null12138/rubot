@@ -1,0 +1,28 @@
+[package]
+name = "rubot"
+version = "0.1.0"
+edition = "2021"
+description = "Atomic autonomous agent with hierarchical memory and file-based state"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "cookies", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+rustyline = "15"
+html2text = "0.13"
+scraper = "0.22"
+async-trait = "0.1"
+dotenvy = "0.15"
+teloxide = { version = "0.17", features = ["macros"] }
+console = "0.15"
+termimad = "0.31"

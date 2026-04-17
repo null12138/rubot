@@ -1,136 +1,56 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-
 use super::registry::{Tool, ToolResult};
 
-pub struct FileOps {
-    files_dir: PathBuf,
-}
-
+pub struct FileOps { dir: PathBuf }
 impl FileOps {
-    pub fn new(workspace: &Path) -> Self {
-        Self {
-            files_dir: workspace.join("files"),
-        }
+    pub fn new(ws: &Path) -> Self { 
+        let d = ws.join("files");
+        let _ = std::fs::create_dir_all(&d);
+        Self { dir: d.canonicalize().unwrap_or(d) } 
     }
-
-    fn resolve_path(&self, path: &str) -> Result<PathBuf> {
-        let resolved = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            self.files_dir.join(path)
-        };
-        // Security: ensure path is within files dir (or workspace for absolute)
-        let canonical_base = self.files_dir.canonicalize().unwrap_or(self.files_dir.clone());
-        let canonical = resolved
-            .canonicalize()
-            .unwrap_or_else(|_| resolved.clone());
-        if !canonical.starts_with(&canonical_base) && !resolved.starts_with(&self.files_dir) {
-            anyhow::bail!("Path escapes workspace: {}", path);
+    fn p(&self, s: &str) -> Result<PathBuf> {
+        // 强制将所有路径视为相对于 self.dir，并移除 ../ 等危险组件
+        let mut p = self.dir.clone();
+        for component in Path::new(s).components() {
+            match component {
+                std::path::Component::Normal(_c) => p.push(component),
+                _ => {} // 忽略绝对根路径、当前路径(.)和父路径(..)
+            }
         }
-        Ok(resolved)
+        Ok(p)
     }
 }
 
 #[async_trait]
 impl Tool for FileOps {
-    fn name(&self) -> &str {
-        "file_ops"
-    }
-
-    fn description(&self) -> &str {
-        "Read, write, append, or list files in your workspace. All paths are relative to a private files directory — you do not need to worry about where files are stored."
-    }
-
+    fn name(&self) -> &str { "file_ops" }
+    fn description(&self) -> &str { "Read, write, append, or list files in the sandbox." }
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["read", "write", "list", "append"],
-                    "description": "The file operation to perform"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File path relative to workspace files directory"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write (for write/append actions)"
-                }
-            },
-            "required": ["action", "path"]
-        })
+        serde_json::json!({"type": "object", "properties": {"act": {"type": "string", "enum": ["read", "write", "list", "append"]}, "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["act", "path"]})
     }
 
     async fn execute(&self, params: serde_json::Value) -> Result<ToolResult> {
-        let action = params["action"].as_str().unwrap_or("");
-        let path_str = params["path"].as_str().unwrap_or("");
-
-        if path_str.is_empty() {
-            return Ok(ToolResult::err("Missing 'path' parameter".to_string()));
-        }
-
-        let path = match self.resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::err(format!("Invalid path: {}", e))),
-        };
-
-        match action {
-            "read" => match tokio::fs::read_to_string(&path).await {
-                Ok(content) => Ok(ToolResult::ok(content)),
-                Err(e) => Ok(ToolResult::err(format!("Read failed: {}", e))),
-            },
-            "write" => {
-                let content = params["content"].as_str().unwrap_or("");
-                if let Some(parent) = path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                match tokio::fs::write(&path, content).await {
-                    Ok(()) => Ok(ToolResult::ok(format!("Written to {}", path_str))),
-                    Err(e) => Ok(ToolResult::err(format!("Write failed: {}", e))),
-                }
-            }
-            "append" => {
-                let content = params["content"].as_str().unwrap_or("");
-                use tokio::io::AsyncWriteExt;
-                match tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .await
-                {
-                    Ok(mut f) => match f.write_all(content.as_bytes()).await {
-                        Ok(()) => Ok(ToolResult::ok(format!("Appended to {}", path_str))),
-                        Err(e) => Ok(ToolResult::err(format!("Append failed: {}", e))),
-                    },
-                    Err(e) => Ok(ToolResult::err(format!("Open failed: {}", e))),
-                }
+        let act = params["act"].as_str().unwrap_or("");
+        let path = self.p(params["path"].as_str().unwrap_or(""))?;
+        match act {
+            "read" => tokio::fs::read_to_string(path).await.map(ToolResult::ok).or_else(|e| Ok(ToolResult::err(e.to_string()))),
+            "write" | "append" => {
+                if let Some(p) = path.parent() { let _ = tokio::fs::create_dir_all(p).await; }
+                let c = params["content"].as_str().unwrap_or("");
+                let res = if act == "write" { tokio::fs::write(&path, c).await }
+                    else { use tokio::io::AsyncWriteExt; tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?.write_all(c.as_bytes()).await };
+                res.map(|_| ToolResult::ok(format!("Done: {}", params["path"].as_str().unwrap_or("")))).or_else(|e| Ok(ToolResult::err(e.to_string())))
             }
             "list" => {
-                let target = if path.is_dir() { &path } else { &self.files_dir };
-                match tokio::fs::read_dir(target).await {
-                    Ok(mut entries) => {
-                        let mut files = Vec::new();
-                        while let Ok(Some(entry)) = entries.next_entry().await {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            let ft = entry.file_type().await.ok();
-                            let marker = if ft.map_or(false, |f| f.is_dir()) {
-                                "/"
-                            } else {
-                                ""
-                            };
-                            files.push(format!("{}{}", name, marker));
-                        }
-                        files.sort();
-                        Ok(ToolResult::ok(files.join("\n")))
-                    }
-                    Err(e) => Ok(ToolResult::err(format!("List failed: {}", e))),
-                }
+                let mut fs = vec![];
+                let mut rd = tokio::fs::read_dir(if path.is_dir() { &path } else { &self.dir }).await?;
+                while let Ok(Some(e)) = rd.next_entry().await { fs.push(format!("{}{}", e.file_name().to_string_lossy(), if e.file_type().await?.is_dir() { "/" } else { "" })); }
+                fs.sort();
+                Ok(ToolResult::ok(if fs.is_empty() { "(empty)".into() } else { fs.join("\n") }))
             }
-            _ => Ok(ToolResult::err(format!("Unknown action: {}", action))),
+            _ => Ok(ToolResult::err("Bad act".into()))
         }
     }
 }

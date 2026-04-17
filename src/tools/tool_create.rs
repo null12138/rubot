@@ -4,10 +4,8 @@ use chrono::Utc;
 use std::path::Path;
 
 use super::registry::{Tool, ToolResult};
-use super::user_tool_manifest;
-use super::user_tool_types::{is_reserved_name, UserToolManifest, UserToolType};
-use crate::memory::index::MemoryIndex;
-use crate::memory::layer::MemoryLayer;
+use super::user_tool_types::{add_tool_to_manifest, is_reserved_name, UserToolManifest, UserToolType};
+use crate::memory::{MemoryLayer, MemorySearch};
 
 pub struct ToolCreate {
     workspace: std::path::PathBuf,
@@ -85,7 +83,7 @@ impl Tool for ToolCreate {
         }
 
         // Check for duplicate
-        if user_tool_manifest::find_tool(&self.workspace, &name).is_some() {
+        if super::user_tool_types::find_tool_in_manifest(&self.workspace, &name).is_some() {
             return Ok(ToolResult::err(format!(
                 "Tool '{}' already exists. Use tool_list to see existing tools.",
                 name
@@ -172,13 +170,13 @@ impl Tool for ToolCreate {
             created: Utc::now().to_rfc3339(),
         };
 
-        if let Err(e) = user_tool_manifest::add_tool(&self.workspace, manifest_entry) {
+        if let Err(e) = add_tool_to_manifest(&self.workspace, manifest_entry) {
             return Ok(ToolResult::err(format!("Failed to save manifest: {}", e)));
         }
 
         // Index to semantic memory
         let memory_path = self.workspace.join("memory");
-        let memory_index = MemoryIndex::new(&memory_path);
+        let memory = MemorySearch::new(&memory_path);
         let mem_summary = format!("Tool created: {} [{}]", name, tool_type_str);
         let mem_content = format!(
             "# Tool: {}\n\n> {}\n\nType: {}\nTags: {}\nDescription: {}",
@@ -192,7 +190,7 @@ impl Tool for ToolCreate {
         if let Some(t) = tags.first() {
             mem_tags.push(t.as_str());
         }
-        let _ = memory_index
+        let _ = memory
             .add_memory(MemoryLayer::Semantic, &mem_summary, &mem_content, &mem_tags)
             .await;
 

@@ -3,8 +3,7 @@ use async_trait::async_trait;
 use std::path::Path;
 
 use super::registry::{Tool, ToolResult};
-use super::user_tool_manifest;
-use super::user_tool_types::UserToolType;
+use super::user_tool_types::{list_tools_in_manifest, UserToolType};
 
 pub struct ToolList {
     workspace: std::path::PathBuf,
@@ -43,7 +42,7 @@ impl Tool for ToolList {
 
     async fn execute(&self, params: serde_json::Value) -> Result<ToolResult> {
         let filter = params["filter"].as_str().unwrap_or("all");
-        let tools = user_tool_manifest::list_tools(&self.workspace);
+        let tools = list_tools_in_manifest(&self.workspace);
 
         let filtered: Vec<_> = tools
             .into_iter()

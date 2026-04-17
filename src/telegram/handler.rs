@@ -8,6 +8,7 @@ use teloxide::types::ParseMode;
 use crate::agent::Agent;
 use super::download;
 use super::formatting;
+use teloxide::types::ReactionType;
 
 pub fn build_handler(
     bot: Bot,
@@ -34,6 +35,12 @@ async fn handle_message(
     upload_dir: PathBuf,
 ) -> anyhow::Result<()> {
     let chat_id = msg.chat.id;
+    tracing::info!("TG message received from chat {}", chat_id);
+
+    // React with 👍 to acknowledge receipt
+    let _ = bot.set_message_reaction(chat_id, msg.id)
+        .reaction(vec![ReactionType::Emoji { emoji: "👍".into() }])
+        .await;
 
     // Extract text and file/image context from the message
     let (text, context) = match extract_message_content(&bot, &msg, &upload_dir).await {
@@ -61,6 +68,7 @@ async fn handle_message(
 
     match response {
         Ok(reply) => {
+            tracing::info!("TG reply ready, length={}", reply.len());
             let formatted = formatting::format_for_telegram(&reply);
             send_long_message(&bot, chat_id, &formatted).await?;
         }

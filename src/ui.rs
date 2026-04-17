@@ -1,28 +1,130 @@
 use console::style;
-use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::Local;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const HEADER_HEIGHT: u16 = 7;
+// ── Output scrollback buffer ──────────────────────────────────────
 
-pub fn enter_alt_screen() { print!("\x1b[?1049h\x1b[H"); let _ = std::io::Write::flush(&mut std::io::stdout()); }
-pub fn exit_alt_screen() { print!("\x1b[?1049l"); let _ = std::io::Write::flush(&mut std::io::stdout()); }
-pub fn clear_terminal() { print!("\x1b[2J\x1b[H"); let _ = std::io::Write::flush(&mut std::io::stdout()); }
+static SCROLLBACK: Mutex<Vec<String>> = Mutex::new(Vec::new()); // lazy init is fine
 
-pub fn term_size() -> (u16, u16) { console::Term::stdout().size() }
-
-pub fn init_scrolling_region() {
-    let (rows, _) = term_size();
-    if rows > (HEADER_HEIGHT + 3) {
-        print!("\x1b[2J");
-        print!("\x1b[{};{}r", HEADER_HEIGHT + 1, rows - 1);
-        print!("\x1b[{};1H", HEADER_HEIGHT + 1);
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+pub fn scrollback_push(line: &str) {
+    if let Ok(mut buf) = SCROLLBACK.lock() {
+        buf.push(line.to_string());
+        // Keep buffer bounded
+        if buf.len() > 10000 { buf.drain(..1000); }
     }
 }
 
-pub fn reset_scrolling_region() {
-    print!("\x1b[r");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+pub fn scrollback_get() -> Vec<String> {
+    SCROLLBACK.lock().map(|b| b.clone()).unwrap_or_default()
+}
+
+/// Enter scrollback pager. Uses raw terminal for j/k/q navigation.
+pub fn scrollback_pager() {
+    let lines = scrollback_get();
+    if lines.is_empty() { return; }
+
+    let (rows, cols) = term_size();
+    let content_height = (rows as usize).saturating_sub(HEADER_LINES as usize + 1); // -header -statusbar
+    if content_height == 0 { return; }
+
+    // Put terminal in raw mode
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) != 0 { return; }
+        t.c_lflag &= !(libc::ECHO | libc::ICANON);
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        libc::tcsetattr(fd, libc::TCSANOW, &t);
+    }
+
+    let total = lines.len();
+    let mut offset = total.saturating_sub(content_height); // start at bottom
+
+    let render = |off: usize| {
+        let top = HEADER_LINES as usize + 1;
+        for i in 0..content_height {
+            let line_idx = off + i;
+            let text = if line_idx < total {
+                let l = &lines[line_idx];
+                let visible: String = l.chars().take(cols as usize - 2).collect();
+                visible
+            } else {
+                String::new()
+            };
+            print!("\x1b[{};1H\x1b[K {}", top + i, style(&text).dim());
+        }
+        // Footer hint
+        print!("\x1b[{};1H\x1b[48;5;238m\x1b[K ↑/↓ j/k scroll · q quit · line {}/{}\x1b[0m", rows, off + 1, total);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    };
+
+    render(offset);
+
+    // Read keys
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    loop {
+        if std::io::stdin().read(&mut buf).unwrap_or(0) == 0 { break; }
+        let s = std::string::String::from_utf8_lossy(&buf[..]);
+        match s.as_ref() {
+            "q" | "\x1b" => break,                         // q or Esc
+            "j" | "\x1b[B" => {                            // j or Down
+                if offset + content_height < total {
+                    offset += 1;
+                    render(offset);
+                }
+            }
+            "k" | "\x1b[A" => {                            // k or Up
+                if offset > 0 {
+                    offset -= 1;
+                    render(offset);
+                }
+            }
+            "\x1b[6~" => {                                  // PageDown
+                offset = (offset + content_height).min(total.saturating_sub(content_height));
+                render(offset);
+            }
+            "\x1b[5~" => {                                  // PageUp
+                offset = offset.saturating_sub(content_height);
+                render(offset);
+            }
+            "G" => {                                        // G = bottom
+                offset = total.saturating_sub(content_height);
+                render(offset);
+            }
+            "g" => {                                        // g = top
+                offset = 0;
+                render(offset);
+            }
+            _ => {}
+        }
+        buf = [0u8; 8];
+    }
+
+    // Restore terminal
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            t.c_lflag |= libc::ECHO | libc::ICANON;
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+        }
+    }
+
+    // Redraw normal view (clear pager overlay, restore content area)
+    clear_terminal();
+    init_scrolling_region();
+    draw_header(&Mood::Idle);
+    // Replay recent lines into the content area
+    let recent_start = total.saturating_sub(content_height);
+    for line in &lines[recent_start..] {
+        println!("{}", line);
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,146 +132,176 @@ pub enum Mood { Idle, Thinking, Happy, Error }
 
 pub struct Pet;
 impl Pet {
-    fn get_tick() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-    }
-    pub fn get_animated_face(mood: &Mood) -> String {
-        let t = Self::get_tick();
+    pub fn face(mood: &Mood) -> String {
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         match mood {
-            Mood::Thinking => {
-                let frames = ["( •_•)", "( o_o)", "( •_•)", "( ._.)"];
-                frames[(t as usize / 200) % frames.len()].to_string()
-            }
+            Mood::Thinking => ["( •_•)", "( o_o)", "( •_•)", "( ._.)"][(t as usize / 200) % 4].to_string(),
             Mood::Happy => "( ^_^)b".to_string(),
             Mood::Error => "( >_<)!".to_string(),
-            Mood::Idle => {
-                let blink = (t / 4000 % 15) == 0;
-                if blink { "( -_-)".to_string() } else { "( •_•)".to_string() }
-            }
+            Mood::Idle => if (t / 4000 % 15) == 0 { "( -_-)".into() } else { "( •_•)".into() }
         }
     }
 }
 
+/// Header occupies this many lines: 5 ASCII art + 1 subtitle + 1 blank.
+const HEADER_LINES: u16 = 7;
+
+pub fn enter_alt_screen() { print!("\x1b[?1049h\x1b[2J\x1b[H"); }
+pub fn exit_alt_screen() { print!("\x1b[?1049l"); }
+pub fn clear_terminal() { print!("\x1b[2J\x1b[H"); }
+pub fn term_size() -> (u16, u16) { console::Term::stdout().size() }
+
+pub fn init_scrolling_region() {
+    let (rows, _) = term_size();
+    let top = HEADER_LINES + 1; // content starts below header
+    let bottom = rows.saturating_sub(1); // leave last line for status bar
+    if bottom > top {
+        print!("\x1b[{};{}r", top, bottom);
+        print!("\x1b[{}H", top);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+}
+pub fn reset_scrolling_region() { print!("\x1b[r"); }
+
 pub fn draw_header(_mood: &Mood) {
-    let (rows, cols) = term_size();
-    if rows < HEADER_HEIGHT { return; }
+    let (_, cols) = term_size();
     let w = cols as usize;
-    let art = [
-        "____        __          __",
-        "/ __ \\__  __/ /_  ____  / /_",
-        "/ /_/ / / / / __ \\/ __ \\/ __/",
-        "/ _, _/ /_/ / /_/ / /_/ / /_",
-        "/_/ |_|\\__,_/_.___/\\____/\\__/"
-    ];
-    let mut out = String::new();
-    out.push_str("\x1b[s\x1b[1;1H"); 
-    for i in 1..=HEADER_HEIGHT { out.push_str(&format!("\x1b[{};1H\x1b[K", i)); }
-    
-    out.push_str("\x1b[2;1H");
+    let art = ["____        __          __","/ __ \\__  __/ /_  ____  / /_","/ /_/ / / / __ \\/ __ \\/ __/","/ _, _/ /_/ / /_/ / /_/ / /_","/_/ |_|\\__,_/_.___/\\____/\\__/"];
+    print!("\x1b[H"); // position at top of screen
     for line in art {
         let pad = w.saturating_sub(line.chars().count()) / 2;
-        out.push_str(&format!("{}{}\n", " ".repeat(pad), style(line).cyan().bold()));
+        println!("{}{}", " ".repeat(pad), style(line).cyan().bold());
     }
-    
-    let tagline = "Atomic autonomous agent with hierarchical memory";
-    let tag_pad = w.saturating_sub(tagline.chars().count()) / 2;
-    out.push_str(&format!("{}{}\n", " ".repeat(tag_pad), style(tagline).dim().italic()));
-    
-    out.push_str("\x1b[u"); 
-    print!("{}", out);
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    println!("{}\n", " ".repeat(w.saturating_sub(44) / 2) + "Atomic autonomous agent | Sandbox | High Speed");
 }
 
-pub fn status_bar(model: &str, workspace: &str, memory_count: usize, mood: &Mood, elapsed: &Option<std::time::Duration>) {
+pub fn status_bar(model: &str, mem: usize, _mood: &Mood) {
     let (rows, cols) = term_size();
     if rows < 2 { return; }
     let w = cols as usize;
-    let time_str = Local::now().format("%H:%M:%S").to_string();
-    let face = Pet::get_animated_face(mood);
-    let ws_display = if workspace.len() > 20 { format!("...{}", &workspace[workspace.len().saturating_sub(17)..]) } else { workspace.to_string() };
+    let time = Local::now().format("%H:%M:%S").to_string();
 
-    let timer_str = match elapsed {
-        Some(d) => format_duration(d),
-        None => String::new(),
-    };
+    let left = format!(" ● {} [Memory:{}]", style(model).cyan().bold(), style(mem).dim());
+    let right = format!("{} ", style(&time).white().dim());
+    let left_w = 2 + model.len() + 1 + 8 + mem.to_string().len() + 1;
+    let right_w = 8 + 1;
+    let pad = w.saturating_sub(left_w + right_w);
 
-    let pet_part = format!(" {} ", style(&face).yellow());
-    let model_part = format!(" {} ", style(model).bold());
-    let mem_part = format!(" [MEM: {}] ", style(memory_count).cyan());
-    let ws_part = format!(" {} ", style(&ws_display).dim());
-
-    // Right side: timer (if active) + clock
-    let timer_part = if timer_str.is_empty() {
-        String::new()
-    } else {
-        format!(" {} ", style(&timer_str).yellow().bold())
-    };
-    let time_part = format!(" {} ", style(&time_str).white());
-
-    let left_w = face.chars().count() + model.chars().count() + 4;
-    let mid_w = memory_count.to_string().len() + 9;
-    let right_w = ws_display.chars().count() + timer_str.chars().count() + time_str.chars().count() + 3;
-
-    let pad_total = w.saturating_sub(left_w + mid_w + right_w + 1);
-    let pad_side = pad_total / 2;
-
-    let theme_bg = "\x1b[48;5;236m";
-    let reset = "\x1b[0m";
-
-    print!(
-        "\x1b[s\x1b[{};1H\x1b[K{}{}{}{}{}{}{}{}{}{}\x1b[u",
-        rows, theme_bg,
-        " ".repeat(pad_side),
-        pet_part, model_part, mem_part, ws_part, timer_part, time_part,
-        " ".repeat(pad_total.saturating_sub(pad_side)),
-        reset
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    use std::io::{Write, stdout};
+    let mut o = stdout().lock();
+    write!(o, "\x1b7\x1b[{};1H\x1b[48;5;236m\x1b[K{}{}{}\x1b[0m\x1b8", rows, left, " ".repeat(pad), right).unwrap();
+    let _ = o.flush();
 }
 
-fn format_duration(d: &std::time::Duration) -> String {
-    let secs = d.as_secs();
-    let mins = secs / 60;
-    let secs = secs % 60;
-    if mins > 0 {
-        format!("{}:{:02}", mins, secs)
-    } else {
-        format!("{}s", secs)
-    }
+pub fn prompt(mood: &Mood) -> String {
+    format!("{} {} ", style(Pet::face(mood)).yellow().bold(), style("›").cyan())
 }
 
-pub fn prompt() -> &'static str { "\x1b[1;36m›\x1b[0m " }
 pub fn print_response(text: &str) {
-    println!();
-    termimad::print_text(text);
-    println!();
-}
-pub fn print_error(err: &str) { println!("\n  {} {}\n", style("×").red().bold(), style(err).red()); }
-pub fn status(msg: &str) { println!("  {} {}", style("•").dim(), style(msg).dim()); }
-pub fn command_output(title: &str, content: &str) { 
-    println!("\n{} {}\n", style("┌").dim(), style(title).bold());
-    termimad::print_text(content);
-    println!();
-}
-pub fn goodbye() { println!("\n  {}\n", style("Bye.").dim()); }
-pub fn help_hint() {
-    print!("  ");
-    for (cmd, desc) in [("/quit", "exit"), ("/plan", "plan"), ("/memory", "mem"), ("/errors", "err")] {
-        print!("{} {}  ", style(cmd).cyan(), style(desc).dim());
+    let cleaned = text.replace("TASK COMPLETE", "");
+    if !cleaned.trim().is_empty() {
+        println!("\n"); termimad::print_text(cleaned.trim()); println!();
+        for line in cleaned.trim().lines() { scrollback_push(line); }
     }
-    println!("\n");
 }
-pub fn tool_call_start(name: &str, params: &str) { println!("  {} {} {}", style("○").yellow(), style(name).white(), style(truncate(params, 50)).dim()); }
+
+pub fn stream_token(token: &str) {
+    use std::io::{Write, stdout};
+    let mut o = stdout().lock();
+    let _ = write!(o, "{}", token);
+    let _ = o.flush();
+    // Accumulate into a pending buffer; flushed on stream_end
+    if let Ok(mut pending) = STREAM_PENDING.lock() { pending.push_str(token); }
+}
+
+static STREAM_PENDING: Mutex<String> = Mutex::new(String::new());
+
+pub fn stream_end() {
+    use std::io::{Write, stdout};
+    let mut o = stdout().lock();
+    let _ = writeln!(o, "\n");
+    let _ = o.flush();
+    // Flush accumulated stream text to scrollback
+    if let Ok(pending) = STREAM_PENDING.lock() {
+        for line in pending.lines() { scrollback_push(line); }
+    }
+    if let Ok(mut pending) = STREAM_PENDING.lock() { pending.clear(); }
+}
+
+/// Suppress terminal echo + canonical mode so keypresses during streaming
+/// don't show as garbage like `[[A`.
+pub fn suppress_input() {
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            t.c_lflag &= !(libc::ECHO | libc::ICANON);
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+        }
+    }
+}
+
+/// Restore terminal to normal (echo + canonical) after streaming.
+pub fn restore_input() {
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            t.c_lflag |= libc::ECHO | libc::ICANON;
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+        }
+    }
+}
+
+/// Drain any pending keypresses from stdin (clear buffered garbage).
+pub fn drain_stdin() {
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            flags |= libc::O_NONBLOCK;
+            libc::fcntl(fd, libc::F_SETFL, flags);
+            let _ = std::io::stdin().read(&mut buf);
+            flags &= !libc::O_NONBLOCK;
+            libc::fcntl(fd, libc::F_SETFL, flags);
+        }
+    }
+}
+
+pub fn print_error(err: &str) { let s = format!("  × {}", err); println!("{}", style(&s).red()); scrollback_push(&s); }
+pub fn status(msg: &str) { let s = format!("  • {}", msg); println!("{}", style(&s).dim()); scrollback_push(&s); }
+pub fn goodbye() { println!("\n  {}\n", style("Bye.").dim()); }
+pub fn help_hint() { let s = "  • /quit  • /plan  • /memory  • /loop  • /scroll"; println!("{}", style(s).cyan()); scrollback_push(s); }
+
+pub fn tool_call_start(name: &str, params: &str) {
+    let s = format!("  ○ {} {}", name, truncate(params, 40));
+    println!("{}", style(&s).dim()); scrollback_push(&s);
+}
 pub fn tool_call_result(ok: bool, out: &str) {
-    let icon = if ok { style("●").green() } else { style("●").red() };
-    println!("    {} {}", icon, style(truncate(out, 70)).dim());
+    let icon = if ok { "● ✓" } else { "● ✗" };
+    let s = format!("    {} {}", icon, truncate(out, 60));
+    let styled = if ok { style(&s).green() } else { style(&s).red() };
+    println!("{}", styled); scrollback_push(&s);
 }
-pub fn llm_round(r: u32, m: &str) { println!("  {} {} {}", style("◎").dim(), style(format!("round {}", r)).dim(), style(m).dim()); }
+pub fn llm_round(r: u32, m: &str) {
+    let s = format!("  ◎ round {} {}", r, m);
+    println!("{}", style(&s).dim()); scrollback_push(&s);
+}
 pub fn plan_step(id: usize, d: &str, s: &str) {
-    let icon = match s { "OK" => style("✓").green(), "FAILED" => style("×").red(), _ => style("→").dim() };
-    println!("  {} Step {}: {}", icon, id, d);
+    let icon = match s { "OK" => "✓", "FAILED" => "×", _ => "→" };
+    let line = format!("  {} Step {}: {}", icon, id, d);
+    println!("{}", style(&line).dim()); scrollback_push(&line);
+}
+pub fn command_output(title: &str, content: &str) {
+    let header = format!("┌ {}", title);
+    println!("\n{}", style(&header).bold()); scrollback_push(&header);
+    for line in content.lines() { scrollback_push(line); }
+    termimad::print_text(content);
 }
 fn truncate(s: &str, max: usize) -> String {
-    let l = s.lines().next().unwrap_or("");
-    if l.chars().count() > max { format!("{}…", l.chars().take(max).collect::<String>()) } else { l.to_string() }
+    let l = s.replace('\n', " ").trim().to_string();
+    if l.chars().count() > max { format!("{}…", l.chars().take(max).collect::<String>()) } else { l }
 }

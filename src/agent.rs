@@ -5,17 +5,15 @@ use crate::config::Config;
 use crate::context::cleaner::ContextCleaner;
 use crate::llm::client::LlmClient;
 use crate::llm::types::*;
-use crate::memory::layer::MemoryLayer;
-use crate::memory::search::MemorySearch;
+use crate::memory::{MemoryLayer, MemorySearch};
 use crate::personality;
-use crate::planner::chain::{StepStatus, ToolCallChain};
-use crate::planner::executor::ChainExecutor;
+use crate::planner::{ChainExecutor, StepStatus, ToolCallChain};
 use crate::reflector::error_book::ErrorBook;
 use crate::state::manager::StateManager;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
     code_exec::CodeExec, file_ops::FileOps, tool_create::ToolCreate, tool_list::ToolList,
-    user_tool_manifest, user_tool_types::UserTool, web_fetch::WebFetch, web_search::WebSearch,
+    user_tool_types, web_fetch::WebFetch, web_search::WebSearch,
 };
 
 use crate::workspace::git::WorkspaceGit;
@@ -53,15 +51,15 @@ impl Agent {
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(WebSearch));
         tools.register(Box::new(WebFetch));
-        tools.register(Box::new(CodeExec::new(config.code_exec_timeout_secs)));
+        tools.register(Box::new(CodeExec::new(config.code_exec_timeout_secs, &config.workspace_path)));
         tools.register(Box::new(FileOps::new(&config.workspace_path)));
         tools.register(Box::new(ToolCreate::new(&config.workspace_path)));
         tools.register(Box::new(ToolList::new(&config.workspace_path)));
 
         // Load user-created tools from manifest
-        let user_tools = user_tool_manifest::list_tools(&config.workspace_path);
+        let user_tools = user_tool_types::list_tools_in_manifest(&config.workspace_path);
         for entry in user_tools {
-            tools.register(Box::new(UserTool::new(
+            tools.register(Box::new(user_tool_types::UserTool::new(
                 entry,
                 &config.workspace_path,
                 config.code_exec_timeout_secs,
@@ -83,7 +81,7 @@ impl Agent {
 
         // Build initial system prompt
         let memory_index = memory
-            .get_index_for_context()
+            .get_index_text()
             .await
             .unwrap_or_else(|_| "(empty)".to_string());
         let error_summary = error_book.to_text();
@@ -112,11 +110,23 @@ impl Agent {
     }
 
     /// Process a user message through the Think → Plan → Act → Reflect loop
+    /// with streaming output for the final text response.
     pub async fn process(&mut self, input: &str) -> Result<String> {
         self.messages.push(Message::user(input));
         self.iteration_count = 0;
 
         self.run_loop().await
+    }
+
+    /// Same as process(), but streams the final text response via callbacks.
+    pub async fn process_stream<F>(&mut self, input: &str, mut on_token: F) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.messages.push(Message::user(input));
+        self.iteration_count = 0;
+
+        self.run_loop_stream(&mut on_token).await
     }
 
     /// Process a user message with additional file/image context attached.
@@ -132,6 +142,7 @@ impl Agent {
 
     /// Core agent loop — called by both process() and process_with_context().
     async fn run_loop(&mut self) -> Result<String> {
+        let mut fingerprint_history = std::collections::HashSet::new();
         loop {
             self.iteration_count += 1;
             if self.iteration_count > self.max_iterations {
@@ -142,15 +153,12 @@ impl Agent {
             }
 
             // === THINK: Prune context if needed ===
-            if self.context_cleaner.needs_pruning(&self.messages) {
+            if self.context_cleaner.needs(&self.messages) {
                 info!("Context pruning triggered");
                 self.prune_context().await?;
             }
 
             // === PLAN: Ask LLM ===
-            // Strategy: first round uses heavy model for understanding intent;
-            // subsequent tool-calling rounds use fast model for speed;
-            // the final synthesis round (no tools returned) goes back to heavy model.
             let tool_defs = self.tools.definitions();
             let is_first_round = self.iteration_count == 1;
 
@@ -186,13 +194,35 @@ impl Agent {
             self.messages.push(assistant_msg.clone());
 
             // === ACT: Handle tool calls or direct response ===
-            if let Some(ref tool_calls) = assistant_msg.tool_calls {
+            if let Some(tool_calls) = assistant_msg.tool_calls {
                 if tool_calls.is_empty() {
                     return Ok(assistant_msg.content.unwrap_or_default());
                 }
 
-                // Execute tool calls in parallel
-                let results = self.execute_tools_parallel(tool_calls).await?;
+                // 指纹检测逻辑
+                let mut filtered_calls = Vec::new();
+                let mut loop_errors = Vec::new();
+
+                for call in tool_calls {
+                    let finger = format!("{}:{}", call.function.name, call.function.arguments);
+                    if fingerprint_history.contains(&finger) {
+                        warn!("Duplicate tool call detected: {}", call.function.name);
+                        loop_errors.push(Message::tool(&call.id, "ERROR: Repeated call detected. You already tried this exact action and it failed or was insufficient. STOP repeating. Use a DIFFERENT approach (e.g., search a different keyword or use web_search if a custom tool failed)."));
+                    } else {
+                        fingerprint_history.insert(finger);
+                        filtered_calls.push(call);
+                    }
+                }
+
+                // 如果全部都是重复调用，且没有新行动，则强制报错注入上下文
+                if filtered_calls.is_empty() {
+                    self.messages.extend(loop_errors);
+                    continue;
+                }
+
+                // Execute remaining unique tool calls in parallel
+                let results = self.execute_tools_parallel(&filtered_calls).await?;
+                self.messages.extend(loop_errors); // 先加入错误提示词
 
                 // Add all tool results to conversation
                 for (tc, result) in results {
@@ -228,9 +258,9 @@ impl Agent {
                     if result.success && tc.function.name == "tool_create" {
                         if let Some(tool_name) = extract_created_tool_name(&result.output) {
                             if let Some(entry) =
-                                user_tool_manifest::find_tool(&self.config.workspace_path, &tool_name)
+                                user_tool_types::find_tool_in_manifest(&self.config.workspace_path, &tool_name)
                             {
-                                self.tools.register(Box::new(UserTool::new(
+                                self.tools.register(Box::new(user_tool_types::UserTool::new(
                                     entry,
                                     &self.config.workspace_path,
                                     self.config.code_exec_timeout_secs,
@@ -294,6 +324,129 @@ impl Agent {
                 let _ = self.save_session_memory().await;
             }
 
+            return Ok(response_text);
+        }
+    }
+
+    /// Streaming variant of run_loop: streams the final text answer token by token.
+    async fn run_loop_stream<F>(&mut self, on_token: &mut F) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        let mut fingerprint_history = std::collections::HashSet::new();
+        loop {
+            self.iteration_count += 1;
+            if self.iteration_count > self.max_iterations {
+                return Ok("Reached maximum iterations.".into());
+            }
+
+            if self.context_cleaner.needs(&self.messages) {
+                self.prune_context().await?;
+            }
+
+            let tool_defs = self.tools.definitions();
+            let is_first_round = self.iteration_count == 1;
+
+            crate::ui::llm_round(self.iteration_count, if is_first_round { "heavy" } else { "fast" });
+
+            let (response, _model_hint) = if is_first_round {
+                (
+                    self.llm.chat(&self.messages, Some(&tool_defs), Some(0.7)).await.context("LLM call failed")?,
+                    "heavy",
+                )
+            } else {
+                (
+                    self.llm.chat_fast(&self.messages, Some(&tool_defs), Some(0.3)).await.context("LLM call failed")?,
+                    "fast",
+                )
+            };
+
+            let choice = response.choices.into_iter().next().context("No response from LLM")?;
+            let assistant_msg = choice.message;
+            self.messages.push(assistant_msg.clone());
+
+            // === ACT ===
+            if let Some(tool_calls) = assistant_msg.tool_calls {
+                if tool_calls.is_empty() {
+                    return Ok(assistant_msg.content.unwrap_or_default());
+                }
+
+                let mut filtered_calls = Vec::new();
+                let mut loop_errors = Vec::new();
+                for call in tool_calls {
+                    let finger = format!("{}:{}", call.function.name, call.function.arguments);
+                    if fingerprint_history.contains(&finger) {
+                        loop_errors.push(Message::tool(&call.id, "ERROR: Repeated call detected. Use a DIFFERENT approach."));
+                    } else {
+                        fingerprint_history.insert(finger);
+                        filtered_calls.push(call);
+                    }
+                }
+                if filtered_calls.is_empty() {
+                    self.messages.extend(loop_errors);
+                    continue;
+                }
+
+                let results = self.execute_tools_parallel(&filtered_calls).await?;
+                self.messages.extend(loop_errors);
+                for (tc, result) in results {
+                    let output_for_log = result.to_string_for_llm();
+                    let truncated_log: String = output_for_log.chars().take(100).collect();
+                    let _ = self.state.log_action(&tc.function.name, &truncated_log, result.success).await;
+                    if !result.success {
+                        if let Some(ref err) = result.error {
+                            if !self.error_book.is_known_error(err) {
+                                self.error_book.record_error(&tc.function.name, err).await?;
+                            }
+                        }
+                    }
+                    if result.success && tc.function.name == "tool_create" {
+                        if let Some(tool_name) = extract_created_tool_name(&result.output) {
+                            if let Some(entry) = user_tool_types::find_tool_in_manifest(&self.config.workspace_path, &tool_name) {
+                                self.tools.register(Box::new(user_tool_types::UserTool::new(entry, &self.config.workspace_path, self.config.code_exec_timeout_secs)));
+                            }
+                        }
+                    }
+                    self.messages.push(Message::tool_result(&tc.id, &result.to_string_for_llm()));
+                    if result.success {
+                        let _ = self.git.commit(&format!("Tool run: {}", tc.function.name));
+                    }
+                }
+                continue;
+            }
+
+            // === Final text response: stream it ===
+            let response_text = assistant_msg.content.unwrap_or_default();
+
+            if let Some(plan) = self.extract_plan(&response_text) {
+                return self.handle_plan(plan).await;
+            }
+
+            // Re-synthesize with heavy model if brief, streaming the output
+            if !is_first_round && response_text.len() < 200 {
+                let synthesis_prompt = format!(
+                    "Based on the tool results above, provide a comprehensive answer to the user's original question. \
+                     The current draft answer is: \"{}\". Improve it with more detail if the tool results contain useful information.",
+                    response_text
+                );
+                self.messages.push(Message::user(&synthesis_prompt));
+                println!(); // blank line before stream
+                let final_text = self.llm.chat_stream(&self.messages, None, Some(0.7), |token| on_token(token)).await?;
+                crate::ui::stream_end();
+                self.messages.pop();
+                return Ok(final_text);
+            }
+
+            // Stream the already-obtained text (print it token-by-token for visual effect)
+            println!();
+            for ch in response_text.chars() {
+                on_token(&ch.to_string());
+            }
+            crate::ui::stream_end();
+
+            if self.iteration_count > 2 {
+                let _ = self.save_session_memory().await;
+            }
             return Ok(response_text);
         }
     }
@@ -401,7 +554,7 @@ impl Agent {
     /// Handle a multi-step plan: show to user, execute, reflect
     async fn handle_plan(&mut self, mut chain: ToolCallChain) -> Result<String> {
         // Show plan to user
-        let plan_md = chain.to_markdown();
+        let plan_md = chain.to_md();
         println!("\n--- Plan ---\n{}\n--- End Plan ---\n", plan_md);
         println!("(Executing plan...)\n");
 
@@ -414,7 +567,7 @@ impl Agent {
         let outputs = executor.execute(&mut chain).await?;
 
         // Update plan state
-        self.state.save_plan(&chain.to_markdown()).await?;
+        self.state.save_plan(&chain.to_md()).await?;
 
         // Build results summary
         let mut summary = format!("## Plan Results: {}\n\n", chain.goal);
@@ -429,7 +582,8 @@ impl Agent {
                 "**Step {} [{}]**: {}\n> {}\n\n",
                 step_id,
                 status,
-                step.description,
+                step.desc,
+
                 if output.chars().count() > 200 {
                     let truncated: String = output.chars().take(200).collect();
                     format!("{}...", truncated)
@@ -466,7 +620,7 @@ impl Agent {
     }
 
     /// Prune context by summarizing older messages
-    async fn prune_context(&mut self) -> Result<()> {
+    pub async fn prune_context(&mut self) -> Result<()> {
         let total = self.messages.len();
         if total <= 6 {
             return Ok(());
@@ -481,8 +635,8 @@ impl Agent {
 
         let to_summarize = &self.messages[start..end];
 
-        // Ask LLM to summarize (use fast model for speed)
-        let summary_prompt = ContextCleaner::build_summary_prompt(to_summarize);
+        // Ask LLM to summarize
+        let summary_prompt = ContextCleaner::prompt(to_summarize);
         let summary_msgs = vec![
             Message::system("You are a summarizer. Be concise."),
             Message::user(&summary_prompt),
@@ -528,10 +682,10 @@ impl Agent {
         let summary = format!("Interaction with {} tool calls", self.iteration_count);
         let content = recent.join("\n---\n");
 
-        self.memory
-            .index()
+        let _ = self.memory
             .add_memory(MemoryLayer::Working, &summary, &content, &[])
-            .await?;
+            .await;
+
 
         let _ = self.git.commit("Save session memory");
 

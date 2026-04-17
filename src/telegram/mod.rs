@@ -25,6 +25,16 @@ pub async fn start_bot(
     };
 
     let bot = Bot::new(token);
+
+    // Verify bot token by fetching bot info
+    match bot.get_me().await {
+        Ok(me) => tracing::info!("TG bot connected: @{}", me.username()),
+        Err(e) => {
+            tracing::error!("TG bot token invalid or network error: {}", e);
+            return Err(anyhow::anyhow!("TG bot connection failed: {}", e));
+        }
+    }
+
     let upload_dir: PathBuf = config.workspace_path.join("tg_uploads");
     tokio::fs::create_dir_all(&upload_dir).await?;
 

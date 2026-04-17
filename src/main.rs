@@ -2,20 +2,19 @@
 
 mod agent;
 mod config;
-mod context;
+mod context { pub mod cleaner; }
 mod llm;
 mod memory;
 mod personality;
 mod planner;
 mod reflector;
-mod state;
+mod state { pub mod manager; }
 mod telegram;
 mod tools;
 mod ui;
-mod workspace;
+mod workspace { pub mod git; }
 
 use config::Config;
-use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use rustyline::completion::{Completer, Pair};
 use rustyline::hint::Hinter;
@@ -28,273 +27,172 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-struct RubotHelper {
-    commands: Vec<String>,
-}
-
+struct RubotHelper { commands: Vec<String> }
 impl Helper for RubotHelper {}
-
 impl Completer for RubotHelper {
     type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        _pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+    fn complete(&self, line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
         if line.starts_with('/') {
-            let matches: Vec<Pair> = self.commands
-                .iter()
-                .filter(|cmd| cmd.starts_with(line))
-                .map(|cmd| Pair {
-                    display: cmd.clone(),
-                    replacement: cmd.clone(),
-                })
-                .collect();
-            return Ok((0, matches));
+            let m: Vec<_> = self.commands.iter().filter(|cmd| cmd.starts_with(line)).map(|cmd| Pair { display: cmd.clone(), replacement: cmd.clone() }).collect();
+            return Ok((0, m));
         }
         Ok((0, Vec::new()))
     }
 }
-
 impl Hinter for RubotHelper {
     type Hint = String;
     fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<String> {
         if line.starts_with('/') && line.len() > 1 {
-            self.commands
-                .iter()
-                .find(|cmd| cmd.starts_with(line))
-                .map(|cmd| {
-                    if cmd.len() > pos {
-                        cmd[pos..].to_string()
-                    } else {
-                        "".to_string()
-                    }
-                })
-        } else {
-            None
-        }
+            self.commands.iter().find(|cmd| cmd.starts_with(line)).map(|cmd| if cmd.len() > pos { cmd[pos..].to_string() } else { "".to_string() })
+        } else { None }
     }
 }
-
 impl Highlighter for RubotHelper {
-    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        std::borrow::Cow::Owned(format!("\x1b[2m{}\x1b[0m", hint))
-    }
+    fn highlight_hint<'h>(&self, h: &'h str) -> std::borrow::Cow<'h, str> { std::borrow::Cow::Owned(format!("\x1b[2m{}\x1b[0m", h)) }
 }
-
 impl Validator for RubotHelper {}
-
 impl RubotHelper {
-    fn new() -> Self {
-        Self {
-            commands: vec![
-                "/quit".to_string(),
-                "/exit".to_string(),
-                "/plan".to_string(),
-                "/memory".to_string(),
-                "/errors".to_string(),
-                "/model".to_string(),
-                "/fast_model".to_string(),
-                "/clear".to_string(),
-            ],
-        }
-    }
+    fn new() -> Self { Self { commands: vec!["/quit","/exit","/plan","/memory","/errors","/model","/fast_model","/clear","/loop","/scroll"].into_iter().map(Into::into).collect() } }
 }
 
-#[derive(Debug, Clone)]
-struct UIState {
-    model: String,
-    workspace: String,
-    memory_count: usize,
-    mood: ui::Mood,
-    task_start: Option<std::time::Instant>,
-}
+#[derive(Clone)]
+struct UIState { mood: ui::Mood, model: String, mem: usize }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rubot=warn")))
-        .with_target(false)
-        .compact()
-        .init();
-
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rubot=info,teloxide=warn"))).with_target(false).compact().init();
     let config = Config::load()?;
     config.ensure_workspace_dirs()?;
-
     let agent_raw = agent::Agent::new(config.clone()).await?;
     let (m1, _) = agent_raw.get_models();
-    let initial_mem = agent_raw.memory().index().get_entries().await.unwrap_or_default().len();
-    let ws_path = config.workspace_path.display().to_string();
-    
-    let ui_state = Arc::new(Mutex::new(UIState {
-        model: m1.clone(),
-        workspace: ws_path.clone(),
-        memory_count: initial_mem,
-        mood: ui::Mood::Idle,
-        task_start: None,
-    }));
+    let initial_mem = agent_raw.memory().get_index().await.unwrap_or_default().len();
 
+    let ui_state = Arc::new(std::sync::Mutex::new(UIState { mood: ui::Mood::Idle, model: m1, mem: initial_mem }));
     let agent = Arc::new(Mutex::new(agent_raw));
-    let _tg_handle = telegram::start_bot(&config, agent.clone()).await?;
+    let _tg = telegram::start_bot(&config, agent.clone()).await?;
 
     ui::enter_alt_screen();
     ui::init_scrolling_region();
     ui::draw_header(&ui::Mood::Idle);
     ui::help_hint();
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let status_ui_state = ui_state.clone();
-    let status_stop_flag = stop_flag.clone();
-    
-    tokio::spawn(async move {
-        let mut last_size = (0, 0);
-        while !status_stop_flag.load(Ordering::Relaxed) {
-            let current_size = ui::term_size();
-            if current_size != last_size {
-                ui::init_scrolling_region();
-                last_size = current_size;
-            }
+    let stop = Arc::new(AtomicBool::new(false));
+    let s_ui = ui_state.clone();
+    let s_stop = stop.clone();
 
-            let state = {
-                if let Ok(s) = status_ui_state.try_lock() { s.clone() }
-                else { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
-            };
-            let elapsed = state.task_start.map(|t| t.elapsed());
-            ui::draw_header(&state.mood);
-            ui::status_bar(&state.model, &state.workspace, state.memory_count, &state.mood, &elapsed);
-            tokio::time::sleep(Duration::from_millis(150)).await;
+    std::thread::spawn(move || {
+        let mut last_size = (0, 0);
+        while !s_stop.load(Ordering::Relaxed) {
+            let size = ui::term_size();
+            if size != last_size { ui::init_scrolling_region(); last_size = size; }
+            let s = s_ui.lock().unwrap().clone();
+            ui::status_bar(&s.model, s.mem, &s.mood);
+            std::thread::sleep(Duration::from_millis(200));
         }
     });
 
-
-    let repl_agent = agent.clone();
-    let repl_ui_state = ui_state.clone();
-    let repl_handle = tokio::task::spawn_blocking(move || run_repl(repl_agent, repl_ui_state));
-
-    let _ = repl_handle.await?;
-    
-    stop_flag.store(true, Ordering::Relaxed);
+    let r_agent = agent.clone();
+    let r_ui = ui_state;
+    let _ = tokio::task::spawn_blocking(move || run_repl(r_agent, r_ui)).await?;
+    stop.store(true, Ordering::Relaxed);
     ui::reset_scrolling_region();
     ui::exit_alt_screen();
-
     Ok(())
 }
 
-fn run_repl(agent: Arc<Mutex<agent::Agent>>, ui_state: Arc<Mutex<UIState>>) -> anyhow::Result<()> {
-    use rustyline::Config as RLConfig;
-    use rustyline::Editor;
-    use crate::ui::Mood;
-    
-    let mut rl: Editor<RubotHelper, FileHistory> = 
-        Editor::with_config(RLConfig::builder().auto_add_history(true).build())?;
+fn run_repl(agent: Arc<Mutex<agent::Agent>>, ui_state: Arc<std::sync::Mutex<UIState>>) -> anyhow::Result<()> {
+    use rustyline::{Config as RLConfig, Editor, error::ReadlineError};
+    let mut rl: Editor<RubotHelper, FileHistory> = Editor::with_config(RLConfig::builder().auto_add_history(true).build())?;
     rl.set_helper(Some(RubotHelper::new()));
-    
-    let history_path = ".rubot_history";
-    let _ = rl.load_history(history_path);
-
+    let _ = rl.load_history(".rubot_history");
     let rt = tokio::runtime::Handle::current();
 
+    let mut loop_mode = false;
+    let mut last_input = String::new();
+    let mut stop_condition = String::new();
+
     loop {
-        match rl.readline(ui::prompt()) {
+        {
+            let ag = rt.block_on(agent.lock());
+            let mut s = ui_state.lock().unwrap();
+            let (m1, _) = ag.get_models();
+            s.model = m1;
+            s.mem = rt.block_on(async { ag.memory().get_index().await.unwrap_or_default().len() });
+        }
+
+        let current_mood = { ui_state.lock().unwrap().mood };
+        let prompt_str = if loop_mode { format!("{} [LOOP] › ", ui::Pet::face(&current_mood)) } else { ui::prompt(&current_mood) };
+
+        let line = if loop_mode && !last_input.is_empty() {
+            Ok(format!("Continue. STOP: {}. End with 'TASK COMPLETE'.", stop_condition))
+        } else {
+            rl.readline(&prompt_str)
+        };
+
+        match line {
             Ok(line) => {
                 let input = line.trim();
-                
-                {
-                    let mut s = rt.block_on(ui_state.lock());
-                    let ag = rt.block_on(agent.lock());
-                    let (m1, _) = ag.get_models();
-                    s.model = m1;
-                    s.memory_count = rt.block_on(ag.memory().index().get_entries()).unwrap_or_default().len();
-                }
-
-                if input.is_empty() {
-                    rt.block_on(ui_state.lock()).mood = Mood::Idle;
-                    continue;
-                }
-
+                if input.is_empty() { { ui_state.lock().unwrap().mood = ui::Mood::Idle; } continue; }
                 if input.starts_with('/') {
                     let parts: Vec<&str> = input.split_whitespace().collect();
-                    let command = parts[0];
-
-                    match command {
-                        "/quit" | "/exit" => {
-                            let mut ag = rt.block_on(agent.lock());
-                            rt.block_on(ag.shutdown());
-                            ui::goodbye();
-                            return Ok(());
-                        }
-                        "/clear" => {
-                            ui::clear_terminal();
-                            ui::init_scrolling_region();
-                            ui::draw_header(&Mood::Idle);
-                            rt.block_on(ui_state.lock()).mood = Mood::Idle;
+                    match parts[0] {
+                        "/quit" | "/exit" => { rt.block_on(async { agent.lock().await.shutdown().await }); ui::goodbye(); return Ok(()); }
+                        "/loop" => {
+                            loop_mode = !loop_mode;
+                            if loop_mode {
+                                let full = parts[1..].join(" ");
+                                if let Some((t, s)) = full.split_once('|') { last_input = t.trim().into(); stop_condition = s.trim().into(); }
+                                else { last_input = full; stop_condition = "done".into(); }
+                                ui::status(&format!("Loop ON | Stop: {}", stop_condition));
+                            } else { ui::status("Loop OFF"); }
                             continue;
                         }
-                        "/plan" => {
-                            let ag = rt.block_on(agent.lock());
-                            let plan = rt.block_on(ag.state().load_plan());
-                            if let Ok(Some(p)) = plan { ui::command_output("Plan", &p); }
-                            else { ui::status("No active plan"); }
-                            continue;
-                        }
-                        "/memory" => {
-                            let ag = rt.block_on(agent.lock());
-                            let index = rt.block_on(ag.memory().get_index_for_context());
-                            if let Ok(text) = index { ui::command_output("Memory Index", &text); }
-                            continue;
-                        }
-                        "/errors" => {
-                            let ag = rt.block_on(agent.lock());
-                            ui::command_output("Error Book", &ag.error_book().to_text());
-                            continue;
-                        }
-                        "/model" => {
-                            if parts.len() > 1 {
-                                let new_model = parts[1];
-                                let mut ag = rt.block_on(agent.lock());
-                                ag.set_model(new_model);
-                                rt.block_on(ui_state.lock()).model = new_model.to_string();
-                            }
-                            continue;
-                        }
-                        _ => { if command.starts_with('/') { ui::print_error("Unknown command"); continue; } }
+                        "/clear" => { ui::clear_terminal(); ui::init_scrolling_region(); ui::draw_header(&ui::Mood::Idle); continue; }
+                        "/plan" => { if let Ok(Some(p)) = rt.block_on(async { agent.lock().await.state().load_plan().await }) { ui::command_output("Plan", &p); } else { ui::status("No plan"); } continue; }
+                        "/memory" => { if let Ok(t) = rt.block_on(async { agent.lock().await.memory().get_index_text().await }) { ui::command_output("Memory", &t); } continue; }
+                        "/errors" => { let t = rt.block_on(async { agent.lock().await.error_book().to_text() }); ui::command_output("Errors", &t); continue; }
+                        "/scroll" => { ui::scrollback_pager(); continue; }
+                        "/model" => { if parts.len() > 1 { rt.block_on(async { agent.lock().await.set_model(parts[1]) }); } continue; }
+                        _ => { if parts[0].starts_with('/') { ui::print_error("Unknown cmd"); continue; } }
                     }
                 }
 
-                {
-                    let mut s = rt.block_on(ui_state.lock());
-                    s.mood = Mood::Thinking;
-                    s.task_start = Some(std::time::Instant::now());
-                }
+                let actual = if loop_mode && !last_input.is_empty() { &last_input } else { input };
+                { ui_state.lock().unwrap().mood = ui::Mood::Thinking; }
 
-                let mut ag = rt.block_on(agent.lock());
-                match rt.block_on(ag.process(input)) {
-                    Ok(response) => {
-                        let mut s = rt.block_on(ui_state.lock());
-                        s.mood = Mood::Happy;
-                        s.task_start = None;
-                        drop(s);
-                        ui::print_response(&response);
+                // Suppress stdin echo during processing to prevent [[A garbage from keypresses
+                ui::suppress_input();
+                let result = if loop_mode {
+                    rt.block_on(async {
+                        let mut ag = agent.lock().await;
+                        ag.process(actual).await
+                    })
+                } else {
+                    rt.block_on(async {
+                        let mut ag = agent.lock().await;
+                        ag.process_stream(actual, |token| crate::ui::stream_token(token)).await
+                    })
+                };
+                ui::drain_stdin();
+                ui::restore_input();
+
+                match result {
+                    Ok(res) => {
+                        { ui_state.lock().unwrap().mood = ui::Mood::Happy; }
+                        ui::print_response(&res);
+                        if loop_mode {
+                            if res.contains("TASK COMPLETE") || res.contains(&stop_condition) { loop_mode = false; ui::status("Loop ended."); { ui_state.lock().unwrap().mood = ui::Mood::Idle; } }
+                            else { last_input = format!("Continue. STOP: {}. End with 'TASK COMPLETE'.", stop_condition); }
+                        } else { { ui_state.lock().unwrap().mood = ui::Mood::Idle; } }
                     }
                     Err(e) => {
-                        let mut s = rt.block_on(ui_state.lock());
-                        s.mood = Mood::Error;
-                        s.task_start = None;
-                        drop(s);
+                        { ui_state.lock().unwrap().mood = ui::Mood::Error; }
                         ui::print_error(&format!("{:#}", e));
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) => { ui::status("Ctrl-C — type /quit to exit"); continue; }
-            Err(ReadlineError::Eof) => {
-                let mut ag = rt.block_on(agent.lock());
-                rt.block_on(ag.shutdown());
-                ui::goodbye();
-                return Ok(());
-            }
-            Err(e) => { ui::print_error(&format!("Input error: {}", e)); return Err(e.into()); }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => { rt.block_on(async { agent.lock().await.shutdown().await }); ui::goodbye(); return Ok(()); }
+            Err(e) => { ui::print_error(&format!("Error: {}", e)); return Err(e.into()); }
         }
     }
 }

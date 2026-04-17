@@ -66,14 +66,3 @@ impl WorkspaceGit {
         Ok(())
     }
 }
-
-/// Helper to automatically commit changes in a block
-pub fn auto_commit<F, R>(workspace: &Path, message: &str, f: F) -> Result<R> 
-where F: FnOnce() -> Result<R> {
-    let git = WorkspaceGit::new(workspace);
-    let result = f();
-    if result.is_ok() {
-        let _ = git.commit(message);
-    }
-    result
-}

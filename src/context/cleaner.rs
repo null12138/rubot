@@ -1,87 +1,30 @@
-use crate::llm::types::Message;
+use crate::llm::types::{Message, Role};
 
-/// Context cleaner: summarizes and prunes old messages to keep context lean
-pub struct ContextCleaner {
-    max_tokens: usize,
-}
-
+pub struct ContextCleaner { pub max: usize }
 impl ContextCleaner {
-    pub fn new(max_tokens: usize) -> Self {
-        Self { max_tokens }
+    pub fn new(max: usize) -> Self { Self { max } }
+    pub fn tokens(ms: &[Message]) -> usize { ms.iter().map(|m| m.tokens()).sum() }
+    pub fn needs(&self, ms: &[Message]) -> bool { Self::tokens(ms) > (self.max * 4 / 5) }
+
+    pub fn prune(&self, ms: &[Message], sum: &str) -> Vec<Message> {
+        if ms.len() <= 4 { return ms.to_vec(); }
+        let mut p = vec![];
+        if let Some(m) = ms.first() { if m.role == Role::System { p.push(m.clone()); } }
+        if !sum.is_empty() { p.push(Message::system(&format!("[Summary]\n{}", sum))); }
+        let start = ms.len().saturating_sub(12);
+        for m in &ms[start..] { if m.role != Role::System { p.push(m.clone()); } }
+        p
     }
 
-    /// Estimate total tokens in the conversation
-    pub fn estimate_tokens(messages: &[Message]) -> usize {
-        messages.iter().map(|m| m.estimated_tokens()).sum()
-    }
-
-    /// Check if context needs pruning
-    pub fn needs_pruning(&self, messages: &[Message]) -> bool {
-        let tokens = Self::estimate_tokens(messages);
-        tokens > (self.max_tokens * 80 / 100) // 80% threshold
-    }
-
-    /// Prune messages: keep system message, summarize old messages, keep recent ones
-    /// Returns (pruned_messages, summary_of_removed)
-    pub fn prune(&self, messages: &[Message], summary: &str) -> Vec<Message> {
-        if messages.len() <= 4 {
-            return messages.to_vec();
-        }
-
-        let mut pruned = Vec::new();
-
-        // Always keep the system message (first)
-        if let Some(first) = messages.first() {
-            if first.role == crate::llm::types::Role::System {
-                pruned.push(first.clone());
+    pub fn prompt(ms: &[Message]) -> String {
+        let mut t = "Summarize this context (max 300 words):\n\n".to_string();
+        for m in ms {
+            if m.role == Role::System { continue; }
+            if let Some(c) = &m.content {
+                let p: String = c.chars().take(200).collect();
+                t.push_str(&format!("{:?}: {}{}\n", m.role, p, if c.len() > 200 { "..." } else { "" }));
             }
         }
-
-        // Add summary of older messages
-        if !summary.is_empty() {
-            pruned.push(Message::system(&format!(
-                "[Context summary of earlier conversation]\n{}",
-                summary
-            )));
-        }
-
-        // Keep the most recent messages (last 6 message pairs)
-        let keep_count = 12.min(messages.len());
-        let start = messages.len() - keep_count;
-        for msg in &messages[start..] {
-            if msg.role != crate::llm::types::Role::System || pruned.is_empty() {
-                pruned.push(msg.clone());
-            }
-        }
-
-        pruned
-    }
-
-    /// Build a summarization prompt for old messages
-    pub fn build_summary_prompt(messages_to_summarize: &[Message]) -> String {
-        let mut text = String::from(
-            "Summarize the following conversation context into key facts and decisions (max 300 words). \
-             Focus on: goals, decisions made, tool results, errors encountered.\n\n",
-        );
-
-        for msg in messages_to_summarize {
-            let role = match msg.role {
-                crate::llm::types::Role::User => "User",
-                crate::llm::types::Role::Assistant => "Assistant",
-                crate::llm::types::Role::System => continue,
-                crate::llm::types::Role::Tool => "Tool",
-            };
-            if let Some(ref content) = msg.content {
-                let preview = if content.chars().count() > 200 {
-                    let truncated: String = content.chars().take(200).collect();
-                    format!("{}...", truncated)
-                } else {
-                    content.clone()
-                };
-                text.push_str(&format!("{}: {}\n", role, preview));
-            }
-        }
-
-        text
+        t
     }
 }

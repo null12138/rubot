@@ -1,0 +1,101 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: rubot-linux-amd64
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: rubot-linux-arm64
+            use_cross: true
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            name: rubot-linux-armhf
+            use_cross: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: rubot-linux-amd64-musl
+            use_cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: rubot-macos-arm64
+            use_cross: false
+          - target: x86_64-apple-darwin
+            os: macos-13
+            name: rubot-macos-amd64
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: rubot-windows-amd64.exe
+            use_cross: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build native
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip rubot 2>/dev/null || true
+          tar czf ../../../${{ matrix.name }}.tar.gz rubot
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.name }}.zip rubot.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

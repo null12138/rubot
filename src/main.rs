@@ -109,6 +109,7 @@ struct UIState {
     workspace: String,
     memory_count: usize,
     mood: ui::Mood,
+    task_start: Option<std::time::Instant>,
 }
 
 #[tokio::main]
@@ -132,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         workspace: ws_path.clone(),
         memory_count: initial_mem,
         mood: ui::Mood::Idle,
+        task_start: None,
     }));
 
     let agent = Arc::new(Mutex::new(agent_raw));
@@ -156,11 +158,12 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let state = {
-                if let Ok(s) = status_ui_state.try_lock() { s.clone() } 
+                if let Ok(s) = status_ui_state.try_lock() { s.clone() }
                 else { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
             };
+            let elapsed = state.task_start.map(|t| t.elapsed());
             ui::draw_header(&state.mood);
-            ui::status_bar(&state.model, &state.workspace, state.memory_count, &state.mood);
+            ui::status_bar(&state.model, &state.workspace, state.memory_count, &state.mood, &elapsed);
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
     });
@@ -260,16 +263,26 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>, ui_state: Arc<Mutex<UIState>>) -> a
                     }
                 }
 
-                rt.block_on(ui_state.lock()).mood = Mood::Thinking;
+                {
+                    let mut s = rt.block_on(ui_state.lock());
+                    s.mood = Mood::Thinking;
+                    s.task_start = Some(std::time::Instant::now());
+                }
 
                 let mut ag = rt.block_on(agent.lock());
                 match rt.block_on(ag.process(input)) {
                     Ok(response) => {
-                        rt.block_on(ui_state.lock()).mood = Mood::Happy;
+                        let mut s = rt.block_on(ui_state.lock());
+                        s.mood = Mood::Happy;
+                        s.task_start = None;
+                        drop(s);
                         ui::print_response(&response);
                     }
                     Err(e) => {
-                        rt.block_on(ui_state.lock()).mood = Mood::Error;
+                        let mut s = rt.block_on(ui_state.lock());
+                        s.mood = Mood::Error;
+                        s.task_start = None;
+                        drop(s);
                         ui::print_error(&format!("{:#}", e));
                     }
                 }

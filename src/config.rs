@@ -56,12 +56,13 @@ impl Config {
 
     pub fn ensure_workspace_dirs(&self) -> anyhow::Result<()> {
         let dirs = [
+            "files",
             "memory/working",
             "memory/episodic",
             "memory/semantic",
             "state",
             "errors",
-            "skills",
+            "tools",
             "tg_uploads",
         ];
         for dir in &dirs {
@@ -81,6 +82,14 @@ impl Config {
             std::fs::write(
                 &error_book_path,
                 "# Error Book\n\n<!-- pattern → solution index -->\n",
+            )?;
+        }
+        // Create tool manifest if missing
+        let manifest_path = self.workspace_path.join("tools/manifest.json");
+        if !manifest_path.exists() {
+            std::fs::write(
+                &manifest_path,
+                r#"{"version": 1, "tools": []}"#,
             )?;
         }
         Ok(())

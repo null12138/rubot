@@ -80,40 +80,62 @@ pub fn draw_header(_mood: &Mood) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-pub fn status_bar(model: &str, workspace: &str, memory_count: usize, mood: &Mood) {
+pub fn status_bar(model: &str, workspace: &str, memory_count: usize, mood: &Mood, elapsed: &Option<std::time::Duration>) {
     let (rows, cols) = term_size();
     if rows < 2 { return; }
     let w = cols as usize;
     let time_str = Local::now().format("%H:%M:%S").to_string();
     let face = Pet::get_animated_face(mood);
     let ws_display = if workspace.len() > 20 { format!("...{}", &workspace[workspace.len().saturating_sub(17)..]) } else { workspace.to_string() };
-    
+
+    let timer_str = match elapsed {
+        Some(d) => format_duration(d),
+        None => String::new(),
+    };
+
     let pet_part = format!(" {} ", style(&face).yellow());
     let model_part = format!(" {} ", style(model).bold());
     let mem_part = format!(" [MEM: {}] ", style(memory_count).cyan());
     let ws_part = format!(" {} ", style(&ws_display).dim());
+
+    // Right side: timer (if active) + clock
+    let timer_part = if timer_str.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", style(&timer_str).yellow().bold())
+    };
     let time_part = format!(" {} ", style(&time_str).white());
 
     let left_w = face.chars().count() + model.chars().count() + 4;
     let mid_w = memory_count.to_string().len() + 9;
-    let right_w = ws_display.chars().count() + time_str.chars().count() + 3;
-    
+    let right_w = ws_display.chars().count() + timer_str.chars().count() + time_str.chars().count() + 3;
+
     let pad_total = w.saturating_sub(left_w + mid_w + right_w + 1);
     let pad_side = pad_total / 2;
 
     let theme_bg = "\x1b[48;5;236m";
     let reset = "\x1b[0m";
 
-    // Fixed mapping: 9 placeholders, 9 arguments.
     print!(
-        "\x1b[s\x1b[{};1H\x1b[K{}{}{}{}{}{}{}{}{}\x1b[u",
+        "\x1b[s\x1b[{};1H\x1b[K{}{}{}{}{}{}{}{}{}{}\x1b[u",
         rows, theme_bg,
         " ".repeat(pad_side),
-        pet_part, model_part, mem_part, ws_part, time_part,
-        " ".repeat(pad_total - pad_side),
+        pet_part, model_part, mem_part, ws_part, timer_part, time_part,
+        " ".repeat(pad_total.saturating_sub(pad_side)),
         reset
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn format_duration(d: &std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let mins = secs / 60;
+    let secs = secs % 60;
+    if mins > 0 {
+        format!("{}:{:02}", mins, secs)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 pub fn prompt() -> &'static str { "\x1b[1;36m›\x1b[0m " }

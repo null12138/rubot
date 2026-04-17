@@ -14,8 +14,8 @@ use crate::reflector::error_book::ErrorBook;
 use crate::state::manager::StateManager;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
-    code_exec::CodeExec, file_ops::FileOps, path_remember::PathRemember, skill_create::SkillCreate,
-    skill_get::SkillGet, tool_forge::ToolForge, web_fetch::WebFetch, web_search::WebSearch,
+    code_exec::CodeExec, file_ops::FileOps, tool_create::ToolCreate, tool_list::ToolList,
+    user_tool_manifest, user_tool_types::UserTool, web_fetch::WebFetch, web_search::WebSearch,
 };
 
 use crate::workspace::git::WorkspaceGit;
@@ -55,10 +55,18 @@ impl Agent {
         tools.register(Box::new(WebFetch));
         tools.register(Box::new(CodeExec::new(config.code_exec_timeout_secs)));
         tools.register(Box::new(FileOps::new(&config.workspace_path)));
-        tools.register(Box::new(SkillCreate::new(&config.workspace_path)));
-        tools.register(Box::new(SkillGet::new(&config.workspace_path)));
-        tools.register(Box::new(ToolForge::new(&config.workspace_path)));
-        tools.register(Box::new(PathRemember::new(&config.workspace_path)));
+        tools.register(Box::new(ToolCreate::new(&config.workspace_path)));
+        tools.register(Box::new(ToolList::new(&config.workspace_path)));
+
+        // Load user-created tools from manifest
+        let user_tools = user_tool_manifest::list_tools(&config.workspace_path);
+        for entry in user_tools {
+            tools.register(Box::new(UserTool::new(
+                entry,
+                &config.workspace_path,
+                config.code_exec_timeout_secs,
+            )));
+        }
 
         // Initialize memory
         let memory_path = config.workspace_path.join("memory");
@@ -79,8 +87,9 @@ impl Agent {
             .await
             .unwrap_or_else(|_| "(empty)".to_string());
         let error_summary = error_book.to_text();
+        let user_tool_list = format_user_tool_list(&tools);
         let system_msg =
-            Message::system(&personality::system_prompt(&memory_index, &error_summary));
+            Message::system(&personality::system_prompt(&memory_index, &error_summary, &user_tool_list));
 
         // Check for unfinished plan
         if state.has_unfinished_plan().await {
@@ -215,6 +224,22 @@ impl Agent {
                         }
                     }
 
+                    // Dynamic tool registration after tool_create succeeds
+                    if result.success && tc.function.name == "tool_create" {
+                        if let Some(tool_name) = extract_created_tool_name(&result.output) {
+                            if let Some(entry) =
+                                user_tool_manifest::find_tool(&self.config.workspace_path, &tool_name)
+                            {
+                                self.tools.register(Box::new(UserTool::new(
+                                    entry,
+                                    &self.config.workspace_path,
+                                    self.config.code_exec_timeout_secs,
+                                )));
+                                info!("Dynamically registered user tool: {}", tool_name);
+                            }
+                        }
+                    }
+
                     self.messages
                         .push(Message::tool_result(&tc.id, &result.to_string_for_llm()));
 
@@ -323,13 +348,14 @@ impl Agent {
                 let path = params["path"].as_str().unwrap_or("");
                 format!("{} {}", action, path)
             }
-            "tool_forge" => {
+            "tool_create" => {
                 let name = params["name"].as_str().unwrap_or("?");
-                format!("create tool: {}", name)
+                let tt = params["tool_type"].as_str().unwrap_or("?");
+                format!("create [{}] {}", tt, name)
             }
-            "path_remember" => {
-                let name = params["task_name"].as_str().unwrap_or("?");
-                format!("save path: {}", name)
+            "tool_list" => {
+                let filter = params["filter"].as_str().unwrap_or("all");
+                format!("list tools ({})", filter)
             }
             _ => {
                 let s = params.to_string();
@@ -554,5 +580,35 @@ impl Agent {
         info!("Shutting down agent...");
         let _ = self.save_session_memory().await;
         info!("Agent shutdown complete.");
+    }
+}
+
+/// Extract tool name from tool_create's [TOOL_CREATED:<name>] output prefix.
+fn extract_created_tool_name(output: &str) -> Option<String> {
+    let prefix = "[TOOL_CREATED:";
+    let start = output.find(prefix)?;
+    let rest = &output[start + prefix.len()..];
+    let end = rest.find(']').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Build a concise listing of user-created tools for the system prompt.
+fn format_user_tool_list(tools: &ToolRegistry) -> String {
+    let built_in: &[&str] = &[
+        "web_search", "web_fetch", "code_exec", "file_ops", "tool_create", "tool_list",
+    ];
+    let mut lines = Vec::new();
+    for name in tools.tool_names() {
+        if built_in.contains(&name.as_str()) {
+            continue;
+        }
+        if let Some(tool) = tools.get(&name) {
+            lines.push(format!("- `{}` — {}", name, tool.description()));
+        }
+    }
+    if lines.is_empty() {
+        "(none yet — use tool_create to make one)".to_string()
+    } else {
+        lines.join("\n")
     }
 }

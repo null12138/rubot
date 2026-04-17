@@ -144,6 +144,9 @@ Workspace layout (created at runtime):
 
 ```
 workspace/
+├── files/                # User work files (reports, research, etc.)
+├── tools/                # Learned tools (Python scripts + manifest.json)
+│   └── manifest.json     # Tool registry: name, type, params, metadata
 ├── memory/
 │   ├── memory_index.md   # L0 index: filename → summary mapping
 │   ├── working/          # L1: current session notes (ephemeral)
@@ -151,7 +154,6 @@ workspace/
 │   └── semantic/         # L3: distilled long-term knowledge
 ├── errors/
 │   └── error_book.md     # Known error patterns and solutions
-├── skills/               # Reusable skill templates (.md)
 └── state/
     ├── current_plan.md   # Active plan (if any)
     └── execution_log.md  # Tool call history with timestamps
@@ -201,14 +203,16 @@ pub trait Tool: Send + Sync {
 
 | Tool | Name | Description |
 |---|---|---|
+| **Built-in Tools** | | |
 | Web Search | `web_search` | Searches DuckDuckGo (HTML scraping), returns titles, URLs, and snippets |
 | Web Fetch | `web_fetch` | Fetches a URL and converts HTML→text, pretty-prints JSON, with length truncation |
 | Code Execution | `code_exec` | Runs bash or Python code via subprocess with configurable timeout |
 | File Operations | `file_ops` | Read, write, append, and list files within the workspace sandbox |
-| Skill Create | `skill_create` | Saves a reusable skill as a Markdown file with YAML frontmatter |
-| Skill Get | `skill_get` | Lists all skills or loads a specific one by name |
+| Tool Create | `tool_create` | Creates a reusable learned tool (script or workflow), immediately callable |
+| Tool List | `tool_list` | Lists all learned tools with name, type, and description |
+| **Learned Tools** | | *(created at runtime via `tool_create`)* |
 
-The `ToolRegistry` dynamically registers tools at startup and generates OpenAI-compatible tool definitions for the LLM.
+The `ToolRegistry` dynamically registers both built-in and learned tools at startup and generates OpenAI-compatible tool definitions for the LLM. Learned tools are loaded from `workspace/tools/manifest.json` and registered as first-class callable tools. New tools created via `tool_create` are registered in real-time without restart.
 
 ### 4. Memory System (`src/memory/`)
 
@@ -321,26 +325,14 @@ On startup, the agent checks for unfinished plans (steps still marked `[ ]` or `
 | `/errors` | Show the error book |
 | Any other text | Sent to the agent as a user message |
 
-## Skill System
+## Learned Tool System
 
-Skills are reusable templates stored as Markdown files in `workspace/skills/`:
+Tools created via `tool_create` are stored in `workspace/tools/` and tracked in `manifest.json`. Two types:
 
-```markdown
----
-name: daily_report
-description: Generate a daily summary report
-trigger: when asked for a daily report or summary
----
+- **Script tools**: Python scripts receiving JSON params via stdin, returning stdout. Managed with `uv` for dependency resolution.
+- **Workflow tools**: Step-by-step instructions returned as context when the tool is called.
 
-# Daily Report Skill
-
-1. Use `web_search` to find today's news on the topic
-2. Use `web_fetch` to read the top 3 articles
-3. Summarize findings into a structured report
-4. Save to `reports/YYYY-MM-DD.md` via `file_ops`
-```
-
-Skills are created via the `skill_create` tool and loaded via `skill_get`. The LLM can create new skills during conversation and reference them later.
+All learned tools are first-class callable tools — the LLM invokes them by name, just like built-in tools. They persist across sessions via the manifest.
 
 ## Security
 

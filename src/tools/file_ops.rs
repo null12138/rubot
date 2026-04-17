@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use super::registry::{Tool, ToolResult};
 
 pub struct FileOps {
-    workspace: PathBuf,
+    files_dir: PathBuf,
 }
 
 impl FileOps {
     pub fn new(workspace: &Path) -> Self {
         Self {
-            workspace: workspace.to_path_buf(),
+            files_dir: workspace.join("files"),
         }
     }
 
@@ -19,14 +19,14 @@ impl FileOps {
         let resolved = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
-            self.workspace.join(path)
+            self.files_dir.join(path)
         };
-        // Security: ensure path is within workspace
-        let canonical_ws = self.workspace.canonicalize().unwrap_or(self.workspace.clone());
+        // Security: ensure path is within files dir (or workspace for absolute)
+        let canonical_base = self.files_dir.canonicalize().unwrap_or(self.files_dir.clone());
         let canonical = resolved
             .canonicalize()
             .unwrap_or_else(|_| resolved.clone());
-        if !canonical.starts_with(&canonical_ws) && !resolved.starts_with(&self.workspace) {
+        if !canonical.starts_with(&canonical_base) && !resolved.starts_with(&self.files_dir) {
             anyhow::bail!("Path escapes workspace: {}", path);
         }
         Ok(resolved)
@@ -40,7 +40,7 @@ impl Tool for FileOps {
     }
 
     fn description(&self) -> &str {
-        "Read, write, or list files in the workspace. Actions: read, write, list, append."
+        "Read, write, append, or list files in your workspace. All paths are relative to a private files directory — you do not need to worry about where files are stored."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -54,7 +54,7 @@ impl Tool for FileOps {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path relative to workspace"
+                    "description": "File path relative to workspace files directory"
                 },
                 "content": {
                     "type": "string",
@@ -89,7 +89,7 @@ impl Tool for FileOps {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
                 match tokio::fs::write(&path, content).await {
-                    Ok(()) => Ok(ToolResult::ok(format!("Written to {}", path.display()))),
+                    Ok(()) => Ok(ToolResult::ok(format!("Written to {}", path_str))),
                     Err(e) => Ok(ToolResult::err(format!("Write failed: {}", e))),
                 }
             }
@@ -103,14 +103,14 @@ impl Tool for FileOps {
                     .await
                 {
                     Ok(mut f) => match f.write_all(content.as_bytes()).await {
-                        Ok(()) => Ok(ToolResult::ok(format!("Appended to {}", path.display()))),
+                        Ok(()) => Ok(ToolResult::ok(format!("Appended to {}", path_str))),
                         Err(e) => Ok(ToolResult::err(format!("Append failed: {}", e))),
                     },
                     Err(e) => Ok(ToolResult::err(format!("Open failed: {}", e))),
                 }
             }
             "list" => {
-                let target = if path.is_dir() { &path } else { &self.workspace };
+                let target = if path.is_dir() { &path } else { &self.files_dir };
                 match tokio::fs::read_dir(target).await {
                     Ok(mut entries) => {
                         let mut files = Vec::new();

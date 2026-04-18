@@ -6,7 +6,7 @@ description = "Atomic autonomous agent with hierarchical memory and file-based s
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "cookies", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "brotli", "cookies", "rustls-tls", "stream"] }
 libc = "0.2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

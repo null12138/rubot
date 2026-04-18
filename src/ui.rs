@@ -1,5 +1,4 @@
 use console::style;
-use chrono::Local;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -114,14 +113,13 @@ pub fn scrollback_pager() {
         }
     }
 
-    // Redraw normal view (clear pager overlay, restore content area)
+    // Redraw normal view
     clear_terminal();
-    init_scrolling_region();
     draw_header(&Mood::Idle);
-    // Replay recent lines into the content area
+    // Replay recent lines
     let recent_start = total.saturating_sub(content_height);
     for line in &lines[recent_start..] {
-        println!("{}", line);
+        println!("{}", style(line).dim());
     }
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -146,29 +144,17 @@ impl Pet {
 /// Header occupies this many lines: 5 ASCII art + 1 subtitle + 1 blank.
 const HEADER_LINES: u16 = 7;
 
-pub fn enter_alt_screen() { print!("\x1b[?1049h\x1b[2J\x1b[H"); }
-pub fn exit_alt_screen() { print!("\x1b[?1049l"); }
-pub fn clear_terminal() { print!("\x1b[2J\x1b[H"); }
-pub fn term_size() -> (u16, u16) { console::Term::stdout().size() }
-
-pub fn init_scrolling_region() {
-    let (rows, _) = term_size();
-    let top = HEADER_LINES + 1; // content starts below header
-    let bottom = rows.saturating_sub(1); // leave last line for status bar
-    if bottom > top {
-        print!("\x1b[{};{}r", top, bottom);
-        print!("\x1b[{}H", top);
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-    }
+pub fn clear_terminal() {
+    // Clear screen and move cursor home, then print a separator
+    print!("\x1b[2J\x1b[H");
+    use std::io::Write; let _ = std::io::stdout().flush();
 }
-pub fn reset_scrolling_region() { print!("\x1b[r"); }
+pub fn term_size() -> (u16, u16) { console::Term::stdout().size() }
 
 pub fn draw_header(_mood: &Mood) {
     let (_, cols) = term_size();
     let w = cols as usize;
     let art = ["____        __          __","/ __ \\__  __/ /_  ____  / /_","/ /_/ / / / __ \\/ __ \\/ __/","/ _, _/ /_/ / /_/ / /_/ / /_","/_/ |_|\\__,_/_.___/\\____/\\__/"];
-    print!("\x1b[H"); // position at top of screen
     for line in art {
         let pad = w.saturating_sub(line.chars().count()) / 2;
         println!("{}{}", " ".repeat(pad), style(line).cyan().bold());
@@ -176,25 +162,7 @@ pub fn draw_header(_mood: &Mood) {
     println!("{}\n", " ".repeat(w.saturating_sub(44) / 2) + "Atomic autonomous agent | Sandbox | High Speed");
 }
 
-pub fn status_bar(model: &str, mem: usize, _mood: &Mood) {
-    let (rows, cols) = term_size();
-    if rows < 2 { return; }
-    let w = cols as usize;
-    let time = Local::now().format("%H:%M:%S").to_string();
-
-    let left = format!(" ● {} [Memory:{}]", style(model).cyan().bold(), style(mem).dim());
-    let right = format!("{} ", style(&time).white().dim());
-    let left_w = 2 + model.len() + 1 + 8 + mem.to_string().len() + 1;
-    let right_w = 8 + 1;
-    let pad = w.saturating_sub(left_w + right_w);
-
-    use std::io::{Write, stdout};
-    let mut o = stdout().lock();
-    write!(o, "\x1b7\x1b[{};1H\x1b[48;5;236m\x1b[K{}{}{}\x1b[0m\x1b8", rows, left, " ".repeat(pad), right).unwrap();
-    let _ = o.flush();
-}
-
-pub fn prompt(mood: &Mood) -> String {
+pub fn prompt(mood: &Mood, _model: &str, _mem: usize) -> String {
     format!("{} {} ", style(Pet::face(mood)).yellow().bold(), style("›").cyan())
 }
 

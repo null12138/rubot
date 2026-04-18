@@ -23,7 +23,6 @@ use rustyline::validate::Validator;
 use rustyline::Helper;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
@@ -71,32 +70,16 @@ async fn main() -> anyhow::Result<()> {
     let agent = Arc::new(Mutex::new(agent_raw));
     let _tg = telegram::start_bot(&config, agent.clone()).await?;
 
-    ui::enter_alt_screen();
-    ui::init_scrolling_region();
+    ui::clear_terminal();
     ui::draw_header(&ui::Mood::Idle);
     ui::help_hint();
 
     let stop = Arc::new(AtomicBool::new(false));
-    let s_ui = ui_state.clone();
-    let s_stop = stop.clone();
-
-    std::thread::spawn(move || {
-        let mut last_size = (0, 0);
-        while !s_stop.load(Ordering::Relaxed) {
-            let size = ui::term_size();
-            if size != last_size { ui::init_scrolling_region(); last_size = size; }
-            let s = s_ui.lock().unwrap().clone();
-            ui::status_bar(&s.model, s.mem, &s.mood);
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    });
 
     let r_agent = agent.clone();
     let r_ui = ui_state;
     let _ = tokio::task::spawn_blocking(move || run_repl(r_agent, r_ui)).await?;
     stop.store(true, Ordering::Relaxed);
-    ui::reset_scrolling_region();
-    ui::exit_alt_screen();
     Ok(())
 }
 
@@ -121,7 +104,11 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>, ui_state: Arc<std::sync::Mutex<UISt
         }
 
         let current_mood = { ui_state.lock().unwrap().mood };
-        let prompt_str = if loop_mode { format!("{} [LOOP] › ", ui::Pet::face(&current_mood)) } else { ui::prompt(&current_mood) };
+        let prompt_str = if loop_mode {
+            format!("{} [LOOP] › ", ui::Pet::face(&current_mood))
+        } else {
+            ui::prompt(&current_mood, "", 0)
+        };
 
         let line = if loop_mode && !last_input.is_empty() {
             Ok(format!("Continue. STOP: {}. End with 'TASK COMPLETE'.", stop_condition))
@@ -147,7 +134,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>, ui_state: Arc<std::sync::Mutex<UISt
                             } else { ui::status("Loop OFF"); }
                             continue;
                         }
-                        "/clear" => { ui::clear_terminal(); ui::init_scrolling_region(); ui::draw_header(&ui::Mood::Idle); continue; }
+                        "/clear" => { ui::clear_terminal(); ui::draw_header(&ui::Mood::Idle); continue; }
                         "/plan" => { if let Ok(Some(p)) = rt.block_on(async { agent.lock().await.state().load_plan().await }) { ui::command_output("Plan", &p); } else { ui::status("No plan"); } continue; }
                         "/memory" => { if let Ok(t) = rt.block_on(async { agent.lock().await.memory().get_index_text().await }) { ui::command_output("Memory", &t); } continue; }
                         "/errors" => { let t = rt.block_on(async { agent.lock().await.error_book().to_text() }); ui::command_output("Errors", &t); continue; }

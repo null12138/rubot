@@ -1,57 +1,101 @@
 # Rubot
 
-An autonomous AI agent built in Rust with hierarchical memory, multi-step planning, and reflective error learning.
-
-Rubot runs a continuous **Think → Plan → Act → Reflect** loop powered by any OpenAI-compatible LLM. It can search the web, execute code, manage files, and learn from its own mistakes — all through a terminal REPL.
+Minimal autonomous AI agent in Rust: LLM + core tools + flat-file memory. A Think→Act loop that runs in a terminal REPL.
 
 ## Features
 
-- **LLM-Agnostic** — works with any OpenAI-compatible API (OpenAI, Azure, local models via Ollama/vLLM/LM Studio, etc.)
-- **Tool-Calling Architecture** — 6 built-in tools (web search, web fetch, code execution, file ops, skill create/get)
-- **Hierarchical Memory** — 3-layer memory system (Working → Episodic → Semantic) with L0 index for fast lookup
-- **Multi-Step Planning** — LLM generates JSON plans with step dependencies, executed sequentially with automatic retry
-- **Error Book** — automatically records errors and their solutions; consults known fixes before retrying
-- **Context Pruning** — when conversation exceeds token limits, older messages are summarized to keep context lean
-- **Skill System** — create and load reusable skill templates stored as Markdown files
-- **Session Persistence** — plans and execution logs survive across sessions; unfinished plans are detected on restart
+- **LLM-agnostic** — works with any OpenAI-compatible API (OpenAI, Azure, Ollama, vLLM, LM Studio, etc.)
+- **Five built-in tools** — `web_search`, `web_fetch`, `code_exec`, `file_ops`, `latex_pdf`
+- **MD-backed tools** — drop a `.md` file in `workspace/tools/` to add new tools at runtime
+- **Flat-file memory** — three-layer Ebbinghaus-style memory (working / episodic / semantic)
+- **Multi-step plans** — LLM can emit a JSON plan that executes sequentially
+- **Loop mode** — drive a single task with a stop condition
+- **Heavy/fast model split** — first turn uses the heavy model, follow-ups use the fast model
 
-## Quick Start
+## Installation
 
-### Prerequisites
+### Pre-built binaries (recommended)
 
-- Rust 1.70+ (edition 2021)
-- An OpenAI-compatible API endpoint
+Download the latest release for your platform from [GitHub Releases](https://github.com/opener/rubot/releases/latest).
 
-### Install & Run
+| Platform | File |
+|---|---|
+| Linux x86_64 | `rubot-linux-amd64.tar.gz` |
+| Linux ARM64 | `rubot-linux-arm64.tar.gz` |
+| Linux ARMv7 | `rubot-linux-armhf.tar.gz` |
+| Linux x86_64 (static) | `rubot-linux-amd64-musl.tar.gz` |
+| macOS Apple Silicon | `rubot-macos-arm64.tar.gz` |
+| macOS Intel | `rubot-macos-amd64.tar.gz` |
+| Windows x86_64 | `rubot-windows-amd64.zip` |
+
+**Linux / macOS:**
 
 ```bash
-git clone <repo-url> rubot
-cd rubot
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your API key and endpoint
-
-cargo run
+tar xzf rubot-linux-amd64.tar.gz
+sudo mv rubot /usr/local/bin/
 ```
 
-### Configuration
+**Windows:**
 
-All settings are controlled via environment variables (`.env` file):
+Extract `rubot.exe` from the zip and place it somewhere on your PATH.
+
+### One-line install
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/opener/rubot.git
+cd rubot
+cargo build --release
+./target/release/rubot
+```
+
+## Prerequisites
+
+| | Shell | Python |
+|---|---|---|
+| **Linux** | bash (preinstalled) | `sudo apt-get install python3` |
+| **macOS** | bash (preinstalled) | `brew install python3` or Xcode CLI tools |
+| **Windows** | PowerShell (preinstalled) | [python.org](https://python.org) or `winget install Python.Python.3` |
+
+> On Windows, `lang: "bash"` in `code_exec` runs PowerShell. `lang: "python"` uses `python` (not `python3`).
+
+## Configuration
+
+All settings via environment variables (`.env` file in the working directory):
 
 | Variable | Default | Description |
 |---|---|---|
-| `RUBOT_API_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API endpoint |
-| `RUBOT_API_KEY` | `sk-placeholder` | API authentication key |
-| `RUBOT_MODEL` | `gpt-4o` | Model name to use |
-| `RUBOT_WORKSPACE` | `workspace` | Path to the workspace directory |
-| `RUBOT_MAX_CONTEXT_TOKENS` | `120000` | Token limit before context pruning triggers |
-| `RUBOT_MAX_RETRIES` | `3` | Max retry attempts for LLM calls and tool failures |
-| `RUBOT_CODE_EXEC_TIMEOUT` | `30` | Timeout in seconds for code execution |
+| `RUBOT_API_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint |
+| `RUBOT_API_KEY` | `sk-placeholder` | API key |
+| `RUBOT_MODEL` | `gpt-4o` | Heavy model name |
+| `RUBOT_FAST_MODEL` | = `RUBOT_MODEL` | Fast model for follow-up turns |
+| `RUBOT_WORKSPACE` | `workspace` | Workspace directory (relative or absolute) |
+| `RUBOT_MAX_RETRIES` | `3` | Max retries for LLM calls |
+| `RUBOT_CODE_EXEC_TIMEOUT` | `30` | `code_exec` timeout (seconds) |
 
-### Using with Local Models
+### Quick setup
 
-Point `RUBOT_API_BASE_URL` to your local inference server:
+```bash
+cp .env.example .env
+# Edit .env with your API key and endpoint
+$EDITOR .env
+rubot
+```
+
+### Local models
 
 ```bash
 # Ollama
@@ -61,302 +105,69 @@ RUBOT_MODEL=llama3
 
 # vLLM
 RUBOT_API_BASE_URL=http://localhost:8000/v1
-RUBOT_API_KEY=token-abc123
-RUBOT_MODEL=meta-llama/Meta-Llama-3-70B
+RUBOT_API_KEY=vllm
+RUBOT_MODEL=meta-llama/Meta-Llama-3-8B-Instruct
 ```
 
-## Architecture
+## Workspace
 
-### Core Loop
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  User Input                                             │
-│      │                                                  │
-│      ▼                                                  │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐           │
-│  │  THINK   │──▶│   PLAN   │──▶│   ACT    │            │
-│  │  (prune  │   │  (LLM    │   │  (tools  │            │
-│  │  context)│   │  decide) │   │  execute)│            │
-│  └──────────┘   └──────────┘   └──────────┘            │
-│       │                              │                   │
-│       │         ┌──────────┐         │                   │
-│       └─────────│ REFLECT  │◀────────┘                  │
-│                 │ (memory  │                             │
-│                 │  +errors)│                             │
-│                 └──────────┘                             │
-└─────────────────────────────────────────────────────────┘
-```
-
-Each user message enters the agent loop. The LLM decides whether to call tools, generate a multi-step plan, or respond directly. Tool results feed back into the loop until the LLM produces a final answer.
-
-### Project Structure
-
-```
-src/
-├── main.rs              # Entry point, REPL loop
-├── agent.rs             # Core agent: Think→Plan→Act→Reflect
-├── config.rs            # Environment configuration
-├── personality.rs       # System prompt template
-│
-├── llm/                 # LLM client
-│   ├── mod.rs
-│   ├── client.rs        # HTTP client with retry logic
-│   └── types.rs         # Message, ToolCall, ChatRequest/Response types
-│
-├── tools/               # Tool implementations
-│   ├── mod.rs
-│   ├── registry.rs      # Dynamic tool registry (trait-based)
-│   ├── web_search.rs    # DuckDuckGo HTML search
-│   ├── web_fetch.rs     # URL → text/markdown converter
-│   ├── code_exec.rs     # Bash/Python code execution
-│   ├── file_ops.rs      # Read/write/list/append in workspace
-│   ├── skill_create.rs  # Save reusable skill templates
-│   └── skill_get.rs     # Load/list skill templates
-│
-├── memory/              # Hierarchical memory system
-│   ├── mod.rs
-│   ├── layer.rs         # L1 Working, L2 Episodic, L3 Semantic enums
-│   ├── store.rs         # Markdown file I/O with YAML frontmatter
-│   ├── index.rs         # L0 memory index (memory_index.md)
-│   └── search.rs        # Quick (index) and deep (content) search
-│
-├── planner/             # Multi-step plan execution
-│   ├── mod.rs
-│   ├── chain.rs         # ToolCallChain with dependency graph
-│   └── executor.rs      # Sequential executor with retry + error book
-│
-├── reflector/           # Reflection and error learning
-│   ├── mod.rs
-│   ├── error_book.rs    # Persistent error→solution mapping
-│   └── matcher.rs       # Error pattern matching
-│
-├── state/               # Cross-session state
-│   ├── mod.rs
-│   └── manager.rs       # Plan persistence + execution log
-│
-└── context/             # Context window management
-    ├── mod.rs
-    └── cleaner.rs       # Token estimation + summarization pruning
-```
-
-Workspace layout (created at runtime):
+On first run, rubot creates a `workspace/` directory structure:
 
 ```
 workspace/
-├── files/                # User work files (reports, research, etc.)
-├── tools/                # Learned tools (Python scripts + manifest.json)
-│   └── manifest.json     # Tool registry: name, type, params, metadata
-├── memory/
-│   ├── memory_index.md   # L0 index: filename → summary mapping
-│   ├── working/          # L1: current session notes (ephemeral)
-│   ├── episodic/         # L2: past interaction summaries
-│   └── semantic/         # L3: distilled long-term knowledge
-├── errors/
-│   └── error_book.md     # Known error patterns and solutions
-└── state/
-    ├── current_plan.md   # Active plan (if any)
-    └── execution_log.md  # Tool call history with timestamps
+├── files/          code_exec sandbox — generated files go here
+├── tools/          MD-backed tool definitions (drop .md files here)
+└── memory/
+    ├── working/    short-term (last few hours)
+    ├── episodic/   medium-term (days)
+    └── semantic/   long-term (permanent)
 ```
 
-## Key Components
+Set `RUBOT_WORKSPACE` to an absolute path to customize the location.
 
-### 1. Agent Loop (`src/agent.rs`)
+## REPL commands
 
-The `Agent` struct orchestrates the entire workflow:
-
-1. **Receive input** — push user message to conversation history
-2. **Check context** — if token count exceeds 80% of `max_context_tokens`, prune via summarization
-3. **Call LLM** — send full conversation + tool definitions to the API
-4. **Handle response**:
-   - **Tool calls** → execute each via `ToolRegistry`, append results, loop back
-   - **Plan JSON** → parse into `ToolCallChain`, show to user, execute steps, synthesize final answer
-   - **Direct text** → return to user
-5. **Reflect** — if the loop ran multiple iterations, save a summary to working memory
-
-The agent enforces a maximum of 20 iterations per request to prevent infinite tool-call loops.
-
-### 2. LLM Client (`src/llm/`)
-
-A lightweight HTTP client using `reqwest` that:
-
-- Sends `ChatCompletion` requests with optional tool definitions
-- Supports `tool_choice: "auto"` for function calling
-- Retries on transient errors (429, 500, 502, 503, timeouts) with exponential backoff
-- Estimates token usage via `chars / 4` heuristic
-
-Compatible with any API that follows the OpenAI chat completions format.
-
-### 3. Tools (`src/tools/`)
-
-All tools implement the async `Tool` trait:
-
-```rust
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    fn parameters_schema(&self) -> serde_json::Value;
-    async fn execute(&self, params: serde_json::Value) -> Result<ToolResult>;
-}
-```
-
-| Tool | Name | Description |
-|---|---|---|
-| **Built-in Tools** | | |
-| Web Search | `web_search` | Searches DuckDuckGo (HTML scraping), returns titles, URLs, and snippets |
-| Web Fetch | `web_fetch` | Fetches a URL and converts HTML→text, pretty-prints JSON, with length truncation |
-| Code Execution | `code_exec` | Runs bash or Python code via subprocess with configurable timeout |
-| File Operations | `file_ops` | Read, write, append, and list files within the workspace sandbox |
-| Tool Create | `tool_create` | Creates a reusable learned tool (script or workflow), immediately callable |
-| Tool List | `tool_list` | Lists all learned tools with name, type, and description |
-| **Learned Tools** | | *(created at runtime via `tool_create`)* |
-
-The `ToolRegistry` dynamically registers both built-in and learned tools at startup and generates OpenAI-compatible tool definitions for the LLM. Learned tools are loaded from `workspace/tools/manifest.json` and registered as first-class callable tools. New tools created via `tool_create` are registered in real-time without restart.
-
-### 4. Memory System (`src/memory/`)
-
-A file-based hierarchical memory inspired by cognitive memory models:
-
-```
-L0  memory_index.md      Fast lookup: filename → one-line summary [+tags]
-│
-├── L1  working/          Current session scratch notes
-│                         Priority: 3 (searched first)
-│                         Lifecycle: cleared on session end
-│
-├── L2  episodic/         Summaries of past interactions
-│                         Priority: 2
-│                         Lifecycle: promoted from L1 on shutdown
-│
-└── L3  semantic/         Distilled long-term knowledge
-                          Priority: 1 (searched last)
-                          Lifecycle: permanent
-```
-
-Each memory entry is a Markdown file with YAML-like frontmatter:
-
-```markdown
----
-summary: Researched Rust async patterns
-created: 2025-04-16T10:30:00+00:00
-layer: Working
-tags: rust, async, tokio
----
-
-# Research Notes
-...
-```
-
-**Search modes:**
-- **Quick search** — scans the L0 index for keyword matches in summaries and tags
-- **Deep search** — loads matching files and ranks by relevance (summary matches weighted 2x vs content matches)
-
-### 5. Planning System (`src/planner/`)
-
-When the LLM encounters a complex task, it outputs a JSON plan:
-
-```json
-{
-  "type": "plan",
-  "goal": "Research and summarize a topic",
-  "steps": [
-    {"tool": "web_search", "params": {"query": "topic"}, "description": "Search for topic"},
-    {"tool": "web_fetch", "params": {"url": "$step_0.result"}, "description": "Fetch top result", "depends_on": [0]},
-    {"tool": "file_ops", "params": {"action": "write", "path": "summary.md", "content": "$step_1.result"}, "description": "Save summary", "depends_on": [1]}
-  ]
-}
-```
-
-The `ChainExecutor`:
-1. Finds the next step with all dependencies satisfied
-2. Resolves `$step_N.result` references from previous step outputs
-3. Executes the tool, retries on failure (up to `max_retries`)
-4. Records errors to the Error Book
-5. Continues until all steps are done or failed
-
-Step status tracking: `[ ]` Pending → `[~]` Running → `[x]` Done / `[!]` Failed / `[-]` Skipped
-
-### 6. Error Book (`src/reflector/`)
-
-A persistent log of error patterns and solutions stored in `workspace/errors/error_book.md`:
-
-```markdown
-# Error Book
-
-## [err_1] web_search error
-- **patterns**: "429" OR "rate limit"
-- **solution**: Wait and retry with backoff
-- **seen**: 2025-04-16, 2025-04-17
-```
-
-When a tool call fails:
-1. The error message is checked against known patterns
-2. If matched, the known solution is returned as context to the LLM
-3. If new, the error is auto-recorded with pattern extraction (HTTP status codes, key phrases like "timeout", "permission denied")
-4. New entries start with a placeholder solution pending LLM classification
-
-### 7. Context Pruning (`src/context/`)
-
-When the estimated token count exceeds 80% of `max_context_tokens`:
-
-1. Messages are split: system (keep) + old messages (summarize) + recent 12 messages (keep)
-2. Old messages are sent to the LLM with a summarization prompt (max 300 words, focus on goals/decisions/results/errors)
-3. The conversation is rebuilt: `[system] + [summary message] + [recent 12 messages]`
-
-This allows Rubot to handle long-running sessions without running out of context.
-
-### 8. State Manager (`src/state/`)
-
-Persists state across sessions using Markdown files:
-
-- `current_plan.md` — the active plan (if any), with step statuses
-- `execution_log.md` — a table of all tool calls with timestamps and outcomes
-
-On startup, the agent checks for unfinished plans (steps still marked `[ ]` or `[~]`) and logs a notice.
-
-## REPL Commands
-
-| Command | Description |
+| Command | Action |
 |---|---|
-| `/quit` or `/exit` | Graceful shutdown (saves session memory) |
-| `/plan` | Show the current active plan |
-| `/memory` | Display the memory index |
-| `/errors` | Show the error book |
-| Any other text | Sent to the agent as a user message |
+| `/quit` / `/exit` | save session memory and exit |
+| `/clear` | clear terminal |
+| `/memory` | list memory index |
+| `/memory <id>` | show a memory entry |
+| `/memory search <query>` | keyword search |
+| `/memory delete <id>` | delete an entry |
+| `/memory clear` | wipe all memories |
+| `/model [name]` | show or set the heavy model |
+| `/plan` | show the last executed plan |
+| `/loop <task>\|<stop>` | auto-loop on a task until stop condition |
 
-## Learned Tool System
+## Project layout
 
-Tools created via `tool_create` are stored in `workspace/tools/` and tracked in `manifest.json`. Two types:
+```
+src/
+├── main.rs          REPL + command dispatcher
+├── agent.rs         Think→Act loop
+├── config.rs        env config
+├── personality.rs   system prompt (OS-aware)
+├── memory.rs        three-layer flat-file memory
+├── planner.rs       multi-step chain executor
+├── markdown.rs      terminal markdown rendering
+├── llm/             OpenAI-compatible client + types
+└── tools/           registry + built-in tools + MD-backed tools
+```
 
-- **Script tools**: Python scripts receiving JSON params via stdin, returning stdout. Managed with `uv` for dependency resolution.
-- **Workflow tools**: Step-by-step instructions returned as context when the tool is called.
+## Cross-compilation
 
-All learned tools are first-class callable tools — the LLM invokes them by name, just like built-in tools. They persist across sessions via the manifest.
+The CI builds 7 targets via GitHub Actions. To cross-compile locally:
 
-## Security
+```bash
+# Install cross
+cargo install cross --version 0.2.5
 
-- **File sandboxing** — `file_ops` resolves all paths relative to the workspace directory and rejects paths that escape it
-- **Code execution timeout** — shell/Python execution has a configurable timeout (default 30s)
-- **API key isolation** — credentials are loaded from `.env` and never written to workspace files
+# Build for ARM64 Linux
+cross build --release --target aarch64-unknown-linux-gnu
+```
 
-## Dependencies
-
-| Crate | Purpose |
-|---|---|
-| `tokio` | Async runtime |
-| `reqwest` | HTTP client for LLM API and web tools |
-| `serde` / `serde_json` | Serialization |
-| `clap` | CLI argument parsing |
-| `anyhow` / `thiserror` | Error handling |
-| `tracing` | Structured logging |
-| `rustyline` | Terminal readline with history |
-| `scraper` | HTML parsing for web search |
-| `html2text` | HTML to text conversion |
-| `chrono` | Timestamps |
-| `uuid` | Unique IDs for memory entries |
-| `regex` | Pattern matching |
-| `dotenvy` | `.env` file loading |
+See `Cross.toml` for Docker image configuration.
 
 ## License
 

@@ -44,21 +44,13 @@ pub struct ChatRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub stream: bool,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ChatResponse {
-    pub choices: Vec<Choice>,
-    pub usage: Option<Usage>,
-}
+pub struct ChatResponse { pub choices: Vec<Choice> }
 
 #[derive(Debug, Deserialize)]
-pub struct Choice { pub message: Message, pub finish_reason: Option<String> }
-
-#[derive(Debug, Deserialize)]
-pub struct Usage { pub prompt_tokens: u32, pub completion_tokens: u32, pub total_tokens: u32 }
+pub struct Choice { pub message: Message }
 
 #[derive(Debug, Deserialize)]
 pub struct ApiError { pub error: ApiErrorDetail }
@@ -77,34 +69,10 @@ impl Message {
         Self { role: Role::Tool, content: Some(c.into()), tool_calls: None, tool_call_id: Some(id.into()) }
     }
     pub fn tool_result(id: &str, c: &str) -> Self { Self::tool(id, c) }
-    pub fn tokens(&self) -> usize {
-        let c = self.content.as_ref().map_or(0, |s| s.len());
-        let t = self.tool_calls.as_ref().map_or(0, |v| v.iter().map(|x| x.function.arguments.len() + x.function.name.len()).sum());
-        (c + t) / 4
-    }
 }
 
 impl ToolDefinition {
     pub fn new(name: &str, desc: &str, params: serde_json::Value) -> Self {
         Self { tool_type: "function".into(), function: FunctionDef { name: name.into(), description: desc.into(), parameters: params } }
     }
-}
-
-// Streaming types
-
-#[derive(Debug, Deserialize)]
-pub struct StreamChunk {
-    pub choices: Vec<StreamChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StreamChoice {
-    pub delta: StreamDelta,
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StreamDelta {
-    pub content: Option<String>,
-    pub tool_calls: Option<Vec<serde_json::Value>>,
 }

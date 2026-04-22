@@ -1,8 +1,34 @@
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
 use reqwest::Client;
 use tracing::{debug, warn};
 use super::types::*;
+
+/// Turn an HTTP error body into a short, terminal-friendly message.
+/// - JSON `{error: {message}}` → just the message.
+/// - HTML (Cloudflare blocks, error pages) → extracts `<title>` or headline, drops the markup.
+/// - Anything else → first 200 chars, single-line.
+fn summarize_error_body(body: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<ApiError>(body) {
+        return parsed.error.message;
+    }
+    let trimmed = body.trim();
+    let looks_like_html = trimmed.starts_with('<') || trimmed.to_lowercase().contains("<html");
+    if looks_like_html {
+        let lower = trimmed.to_lowercase();
+        let pick = |open: &str, close: &str| {
+            lower.find(open).and_then(|s| {
+                let after = s + open.len();
+                lower[after..].find(close).map(|e| trimmed[after..after + e].trim().to_string())
+            })
+        };
+        let headline = pick("<title>", "</title>")
+            .or_else(|| pick("<h1", "</h1>").map(|s| s.trim_start_matches('>').trim().into()))
+            .unwrap_or_else(|| "HTML response (likely Cloudflare/WAF block)".into());
+        return format!("{} — check your provider endpoint/IP", headline);
+    }
+    let one_line: String = trimmed.chars().filter(|c| *c != '\n' && *c != '\r').take(200).collect();
+    if one_line.is_empty() { "(empty body)".into() } else { one_line }
+}
 
 pub struct LlmClient {
     client: Client,
@@ -26,7 +52,6 @@ impl LlmClient {
     }
 
     pub fn update_model(&mut self, model: &str) { self.model = model.into(); }
-    pub fn update_fast_model(&mut self, model: &str) { self.fast_model = model.into(); }
 
     pub async fn chat(&self, msgs: &[Message], tools: Option<&[ToolDefinition]>, temp: Option<f32>) -> Result<ChatResponse> {
         self.exec(&self.model, msgs, tools, temp).await
@@ -44,7 +69,6 @@ impl LlmClient {
             tool_choice: tools.map(|_| serde_json::json!("auto")),
             temperature: temp,
             max_tokens: Some(4096),
-            stream: false,
         };
 
         let mut last_err = None;
@@ -74,75 +98,8 @@ impl LlmClient {
         let status = res.status();
         let body = res.text().await.context("Read body failed")?;
         if !status.is_success() {
-            let msg = serde_json::from_str::<ApiError>(&body).map(|e| e.error.message).unwrap_or(body);
-            bail!("API error ({}): {}", status.as_u16(), msg);
+            bail!("API error ({}): {}", status.as_u16(), summarize_error_body(&body));
         }
         serde_json::from_str(&body).context("Parse JSON failed")
-    }
-
-    /// Stream a chat completion. Returns the full assembled text via a callback.
-    /// `on_token` is called for each received text fragment (for live display).
-    pub async fn chat_stream<F>(
-        &self,
-        msgs: &[Message],
-        tools: Option<&[ToolDefinition]>,
-        temp: Option<f32>,
-        mut on_token: F,
-    ) -> Result<String>
-    where
-        F: FnMut(&str),
-    {
-        let req = ChatRequest {
-            model: self.model.clone(),
-            messages: msgs.to_vec(),
-            tools: tools.map(|t| t.to_vec()),
-            tool_choice: tools.map(|_| serde_json::json!("auto")),
-            temperature: temp,
-            max_tokens: Some(4096),
-            stream: true,
-        };
-
-        let res = self.client.post(&self.api_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&req)
-            .send()
-            .await
-            .context("Stream request failed")?;
-
-        let status = res.status();
-        if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
-            let msg = serde_json::from_str::<ApiError>(&body).map(|e| e.error.message).unwrap_or(body);
-            bail!("API error ({}): {}", status.as_u16(), msg);
-        }
-
-        let mut stream = res.bytes_stream();
-        let mut full_text = String::new();
-        let mut line_buf = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.context("Stream read error")?;
-            line_buf.push_str(&String::from_utf8_lossy(&bytes));
-
-            while let Some(pos) = line_buf.find('\n') {
-                let line = line_buf[..pos].trim().to_string();
-                line_buf = line_buf[pos + 1..].to_string();
-
-                if !line.starts_with("data: ") { continue; }
-                let data = &line[6..];
-                if data == "[DONE]" { break; }
-
-                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                    if let Some(choice) = chunk.choices.first() {
-                        if let Some(ref content) = choice.delta.content {
-                            on_token(content);
-                            full_text.push_str(content);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(full_text)
     }
 }

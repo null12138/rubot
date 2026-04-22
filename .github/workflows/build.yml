@@ -10,7 +10,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +54,7 @@ jobs:
             use_cross: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            name: rubot-windows-amd64.exe
+            name: rubot-windows-amd64
             use_cross: false
 
     runs-on: ${{ matrix.os }}
@@ -52,9 +65,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
       - name: Build with cross
         if: matrix.use_cross
@@ -77,10 +96,20 @@ jobs:
           cd target/${{ matrix.target }}/release
           7z a ../../../${{ matrix.name }}.zip rubot.exe
 
+      - name: Generate SHA256 checksum (Unix)
+        if: runner.os != 'Windows'
+        run: sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+
+      - name: Generate SHA256 checksum (Windows)
+        if: runner.os == 'Windows'
+        run: certutil -hashfile ${{ matrix.name }}.zip SHA256 > ${{ matrix.name }}.zip.sha256
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}.*
+          path: |
+            ${{ matrix.name }}.*
+            !${{ matrix.name }}
 
   release:
     needs: build
@@ -93,6 +122,9 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

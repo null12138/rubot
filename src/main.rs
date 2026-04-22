@@ -18,14 +18,28 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-struct RubotHelper { commands: Vec<String> }
+struct RubotHelper {
+    commands: Vec<String>,
+}
 impl Helper for RubotHelper {}
 impl Completer for RubotHelper {
     type Candidate = Pair;
-    fn complete(&self, line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+    fn complete(
+        &self,
+        line: &str,
+        _pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
         if line.starts_with('/') {
-            let m: Vec<_> = self.commands.iter().filter(|c| c.starts_with(line))
-                .map(|c| Pair { display: c.clone(), replacement: c.clone() }).collect();
+            let m: Vec<_> = self
+                .commands
+                .iter()
+                .filter(|c| c.starts_with(line))
+                .map(|c| Pair {
+                    display: c.clone(),
+                    replacement: c.clone(),
+                })
+                .collect();
             return Ok((0, m));
         }
         Ok((0, Vec::new()))
@@ -35,9 +49,16 @@ impl Hinter for RubotHelper {
     type Hint = String;
     fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<String> {
         if line.starts_with('/') && line.len() > 1 {
-            self.commands.iter().find(|c| c.starts_with(line))
-                .map(|c| if c.len() > pos { c[pos..].to_string() } else { String::new() })
-        } else { None }
+            self.commands.iter().find(|c| c.starts_with(line)).map(|c| {
+                if c.len() > pos {
+                    c[pos..].to_string()
+                } else {
+                    String::new()
+                }
+            })
+        } else {
+            None
+        }
     }
 }
 impl Highlighter for RubotHelper {
@@ -48,23 +69,38 @@ impl Highlighter for RubotHelper {
 impl Validator for RubotHelper {}
 impl RubotHelper {
     fn new() -> Self {
-        Self { commands: ["/quit","/exit","/plan","/memory","/model","/clear","/loop"]
-            .into_iter().map(Into::into).collect() }
+        Self {
+            commands: [
+                "/quit", "/exit", "/plan", "/memory", "/model", "/config", "/clear", "/loop",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rubot=warn")))
-        .with_target(false).compact().init();
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rubot=warn")),
+        )
+        .with_target(false)
+        .compact()
+        .init();
 
     let config = Config::load()?;
     config.ensure_workspace_dirs()?;
     let agent = Arc::new(Mutex::new(agent::Agent::new(config).await?));
 
-    println!("{}rubot{} {}— /quit to exit · /loop <task>|<stop> to auto-loop{}",
-        markdown::BOLD, markdown::R, markdown::DIM, markdown::R);
+    println!(
+        "{}rubot{} {}— /quit to exit · /loop <task>|<stop> to auto-loop{}",
+        markdown::BOLD,
+        markdown::R,
+        markdown::DIM,
+        markdown::R
+    );
     let a = agent.clone();
     tokio::task::spawn_blocking(move || run_repl(a)).await??;
     Ok(())
@@ -84,7 +120,10 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
 
     loop {
         let line = if loop_mode && !last_input.is_empty() {
-            Ok(format!("Continue. STOP: {}. End with 'TASK COMPLETE'.", stop_condition))
+            Ok(format!(
+                "Continue. STOP: {}. End with 'TASK COMPLETE'.",
+                stop_condition
+            ))
         } else {
             rl.readline("\x1b[1;36mrubot\x1b[0m \x1b[2m›\x1b[0m ")
         };
@@ -92,7 +131,9 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
         match line {
             Ok(line) => {
                 let input = line.trim();
-                if input.is_empty() { continue; }
+                if input.is_empty() {
+                    continue;
+                }
                 if input.starts_with('/') {
                     let parts: Vec<&str> = input.split_whitespace().collect();
                     match parts[0] {
@@ -112,15 +153,25 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                     last_input = full;
                                     stop_condition = "done".into();
                                 }
-                                println!("{}[Loop ON | stop: {}]{}", markdown::YELLOW, stop_condition, markdown::R);
+                                println!(
+                                    "{}[Loop ON | stop: {}]{}",
+                                    markdown::YELLOW,
+                                    stop_condition,
+                                    markdown::R
+                                );
                             } else {
                                 println!("{}[Loop OFF]{}", markdown::DIM, markdown::R);
                             }
                             continue;
                         }
-                        "/clear" => { print!("\x1b[2J\x1b[H"); continue; }
+                        "/clear" => {
+                            print!("\x1b[2J\x1b[H");
+                            continue;
+                        }
                         "/plan" => {
-                            let p = rt.block_on(async { agent.lock().await.last_plan().map(String::from) });
+                            let p = rt.block_on(async {
+                                agent.lock().await.last_plan().map(String::from)
+                            });
                             match p {
                                 Some(p) => println!("\n{}\n", markdown::render(&p)),
                                 None => println!("(no plan yet)"),
@@ -217,11 +268,139 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                             }
                             continue;
                         }
-                        _ => { eprintln!("unknown command: {}", parts[0]); continue; }
+                        "/config" => {
+                            let sub = parts.get(1).copied().unwrap_or("list");
+                            match sub {
+                                "" | "list" => {
+                                    let env_path = config::env_file_path()?;
+                                    let rows =
+                                        rt.block_on(async { agent.lock().await.config().rows() });
+                                    println!("\n.env: {}\n", env_path.display());
+                                    for row in rows {
+                                        println!(
+                                            "{:<18} {:<24} {}",
+                                            row.key.cli_name(),
+                                            row.env_name,
+                                            row.display_value
+                                        );
+                                    }
+                                    println!();
+                                }
+                                "get" => {
+                                    let Some(raw_key) = parts.get(2) else {
+                                        eprintln!("usage: /config get <key>");
+                                        continue;
+                                    };
+                                    let Some(key) = config::ConfigKey::parse(raw_key) else {
+                                        eprintln!("unknown config key: {}", raw_key);
+                                        continue;
+                                    };
+                                    let row = rt.block_on(async {
+                                        agent
+                                            .lock()
+                                            .await
+                                            .config()
+                                            .rows()
+                                            .into_iter()
+                                            .find(|row| row.key == key)
+                                    });
+                                    if let Some(row) = row {
+                                        println!(
+                                            "{} ({}) = {}",
+                                            row.key.cli_name(),
+                                            row.env_name,
+                                            row.display_value
+                                        );
+                                    }
+                                }
+                                "set" => {
+                                    let Some(raw_key) = parts.get(2) else {
+                                        eprintln!("usage: /config set <key> <value>");
+                                        continue;
+                                    };
+                                    let Some(key) = config::ConfigKey::parse(raw_key) else {
+                                        eprintln!("unknown config key: {}", raw_key);
+                                        continue;
+                                    };
+                                    let value =
+                                        parts.get(3..).map(|s| s.join(" ")).unwrap_or_default();
+                                    if value.trim().is_empty() {
+                                        eprintln!("usage: /config set <key> <value>");
+                                        continue;
+                                    }
+
+                                    match config::save_config_value(key, &value) {
+                                        Ok(env_path) => {
+                                            match Config::load() {
+                                                Ok(new_config) => {
+                                                    match rt.block_on(async {
+                                                        agent.lock().await.apply_config(new_config).await
+                                                    }) {
+                                                        Ok(reset) => {
+                                                            let display = if key == config::ConfigKey::ApiKey {
+                                                                "********".to_string()
+                                                            } else {
+                                                                value.trim().to_string()
+                                                            };
+                                                            println!(
+                                                                "saved {}={} to {}",
+                                                                key.cli_name(),
+                                                                display,
+                                                                env_path.display()
+                                                            );
+                                                            if reset {
+                                                                println!("workspace changed; session conversation was reset");
+                                                            } else {
+                                                                println!("applied to current session");
+                                                            }
+                                                        }
+                                                        Err(e) => eprintln!(
+                                                            "{}error:{} failed to apply config: {:#}",
+                                                            markdown::RED,
+                                                            markdown::R,
+                                                            e
+                                                        ),
+                                                    }
+                                                }
+                                                Err(e) => eprintln!(
+                                                    "{}error:{} failed to reload config: {:#}",
+                                                    markdown::RED,
+                                                    markdown::R,
+                                                    e
+                                                ),
+                                            }
+                                        }
+                                        Err(e) => eprintln!(
+                                            "{}error:{} failed to save config: {:#}",
+                                            markdown::RED,
+                                            markdown::R,
+                                            e
+                                        ),
+                                    }
+                                }
+                                "help" => {
+                                    println!(
+                                        "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, workspace, max_retries, code_exec_timeout"
+                                    );
+                                }
+                                _ => {
+                                    eprintln!("usage: /config [list|get|set|help] ...");
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {
+                            eprintln!("unknown command: {}", parts[0]);
+                            continue;
+                        }
                     }
                 }
 
-                let actual = if loop_mode && !last_input.is_empty() { &last_input } else { input };
+                let actual = if loop_mode && !last_input.is_empty() {
+                    &last_input
+                } else {
+                    input
+                };
                 let result = rt.block_on(async { agent.lock().await.process(actual).await });
 
                 match result {
@@ -232,7 +411,10 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                 loop_mode = false;
                                 println!("{}[Loop ended]{}", markdown::DIM, markdown::R);
                             } else {
-                                last_input = format!("Continue. STOP: {}. End with 'TASK COMPLETE'.", stop_condition);
+                                last_input = format!(
+                                    "Continue. STOP: {}. End with 'TASK COMPLETE'.",
+                                    stop_condition
+                                );
                             }
                         }
                     }
@@ -244,7 +426,10 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 println!("bye.");
                 return Ok(());
             }
-            Err(e) => { eprintln!("readline error: {}", e); return Err(e.into()); }
+            Err(e) => {
+                eprintln!("readline error: {}", e);
+                return Err(e.into());
+            }
         }
     }
 }

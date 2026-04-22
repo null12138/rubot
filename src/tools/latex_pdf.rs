@@ -17,7 +17,9 @@ pub struct LatexPdf {
 
 impl LatexPdf {
     pub fn new(ws: &Path) -> Self {
-        Self { workspace: ws.to_path_buf() }
+        Self {
+            workspace: ws.to_path_buf(),
+        }
     }
 }
 
@@ -40,11 +42,13 @@ fn build_tarball(tex: &str) -> Result<Vec<u8>> {
 
 #[async_trait]
 impl Tool for LatexPdf {
-    fn name(&self) -> &str { "latex_pdf" }
+    fn name(&self) -> &str {
+        "latex_pdf"
+    }
 
     fn description(&self) -> &str {
         "Compile LaTeX source to PDF via an online service (no local LaTeX install needed). \
-         Saves the PDF to workspace/files/<name>.pdf and returns its absolute path. \
+         Saves the PDF to the configured workspace `files/` directory as <name>.pdf and returns its absolute path. \
          Use compiler=xelatex for Chinese/CJK, pdflatex for pure English/math."
     }
 
@@ -102,17 +106,31 @@ impl Tool for LatexPdf {
 
         if !status.is_success() {
             let msg: String = String::from_utf8_lossy(&bytes).chars().take(500).collect();
-            return Ok(ToolResult::err(format!("HTTP {}: {}", status.as_u16(), msg)));
+            return Ok(ToolResult::err(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                msg
+            )));
         }
         if bytes.len() < 4 || &bytes[..4] != b"%PDF" {
             let msg: String = String::from_utf8_lossy(&bytes).chars().take(500).collect();
-            return Ok(ToolResult::err(format!("compilation failed (no PDF returned): {}", msg)));
+            return Ok(ToolResult::err(format!(
+                "compilation failed (no PDF returned): {}",
+                msg
+            )));
         }
 
         let out_dir = self.workspace.join("files");
         let _ = tokio::fs::create_dir_all(&out_dir).await;
-        let safe: String = name.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let out_path = out_dir.join(format!("{}.pdf", safe));
         tokio::fs::write(&out_path, &bytes).await?;
@@ -133,7 +151,8 @@ mod tests {
 
     #[test]
     fn tarball_has_gzip_magic() {
-        let bytes = build_tarball(r"\documentclass{article}\begin{document}Hi\end{document}").unwrap();
+        let bytes =
+            build_tarball(r"\documentclass{article}\begin{document}Hi\end{document}").unwrap();
         assert!(bytes.len() > 20);
         assert_eq!(&bytes[..2], &[0x1f, 0x8b], "not gzip");
     }

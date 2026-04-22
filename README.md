@@ -125,6 +125,8 @@ workspace/
 
 Set `RUBOT_WORKSPACE` to an absolute path to customize the location.
 
+`file_ops` uses `workspace/files/` as the default base for bare relative paths like `foo.txt`, but you can also target `tools/...`, `memory/...`, `files/...`, or any absolute path that stays inside the configured workspace root.
+
 ## REPL commands
 
 | Command | Action |
@@ -137,6 +139,9 @@ Set `RUBOT_WORKSPACE` to an absolute path to customize the location.
 | `/memory delete <id>` | delete an entry |
 | `/memory clear` | wipe all memories |
 | `/model [name]` | show or set the heavy model |
+| `/config` | list effective config and `.env` path |
+| `/config get <key>` | show one config value |
+| `/config set <key> <value>` | save config to `.env` and apply it |
 | `/plan` | show the last executed plan |
 | `/loop <task>\|<stop>` | auto-loop on a task until stop condition |
 

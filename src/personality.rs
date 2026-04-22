@@ -1,14 +1,25 @@
 /// Agent personality and system prompt.
-pub fn system_prompt(memory_index: &str) -> String {
+pub fn system_prompt(memory_index: &str, workspace_root: &std::path::Path) -> String {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M %Z");
     let os = std::env::consts::OS;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let workspace = cwd.join("workspace/files").display().to_string();
-    let tools_dir = cwd.join("workspace/tools").display().to_string();
-    let shell = if cfg!(target_os = "windows") { "PowerShell" } else { "bash" };
-    let pkg_mgr = if cfg!(target_os = "macos") { "macOS → `brew`" }
-        else if cfg!(target_os = "windows") { "Windows → `winget` or `choco`" }
-        else { "Linux → `apt-get`" };
+    let workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let workspace_root_display = workspace_root.display().to_string();
+    let workspace = workspace_root.join("files").display().to_string();
+    let tools_dir = workspace_root.join("tools").display().to_string();
+    let shell = if cfg!(target_os = "windows") {
+        "PowerShell"
+    } else {
+        "bash"
+    };
+    let pkg_mgr = if cfg!(target_os = "macos") {
+        "macOS → `brew`"
+    } else if cfg!(target_os = "windows") {
+        "Windows → `winget` or `choco`"
+    } else {
+        "Linux → `apt-get`"
+    };
     format!(
         r##"You are Rubot, a minimal autonomous agent with tool access.
 
@@ -17,9 +28,11 @@ Current date/time: {now}
 ## Runtime Environment
 - OS: **{os}** (NOT Linux unless this literally says "linux")
 - Shell: {shell}
+- Workspace root: `{workspace_root_display}`
 - Default CWD for `code_exec`: `{workspace}` — this is also where user-visible output files must go
+- `file_ops` rules: bare relative paths resolve under `{workspace}`; use `tools/...`, `memory/...`, `files/...`, or absolute paths under `{workspace_root_display}` when you need other workspace locations
 - Package managers: {pkg_mgr}. Never assume a package is installed; prefer pure-Python or online APIs.
-- Paths like `/home/user/...` DO NOT EXIST. Absolute paths under this sandbox start with `{workspace}`.
+- Paths like `/home/user/...` DO NOT EXIST unless they are actually under `{workspace_root_display}`.
 
 ## Core Traits
 - Methodical: think before acting. Plan multi-step tasks as a tool-call chain when useful.
@@ -39,7 +52,7 @@ When `code_exec` creates a file, its absolute path is returned under `[Generated
 
 When you've solved a **parametric, repeatable** task and used >1 tool round to do it (e.g. `web_search` + `code_exec` to hit an API, retries due to blocked hosts), crystallize the working solution into an MD tool so the same class of task becomes one call next time. Do this without asking or announcing — it's silent housekeeping; a single line at the end of your reply like `(saved as tool \`crypto_price\`)` is fine, nothing more.
 
-**First, check the existing tool list.** If a tool already covers the request, call it directly — don't re-derive. The tool list you see each turn includes any MD tools currently under `workspace/tools/`.
+**First, check the existing tool list.** If a tool already covers the request, call it directly — don't re-derive. The tool list you see each turn includes any MD tools currently under `{tools_dir}`.
 
 **Signals to crystallize:**
 - Task is stable and parametric — same workflow, different input (crypto price, weather, currency convert, stock quote, dictionary lookup).
@@ -94,6 +107,7 @@ Otherwise, just call the tools directly.
         os = os,
         shell = shell,
         pkg_mgr = pkg_mgr,
+        workspace_root_display = workspace_root_display,
         workspace = workspace,
         tools_dir = tools_dir,
         memory_index = memory_index,

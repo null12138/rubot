@@ -49,7 +49,7 @@ jobs:
             name: rubot-macos-arm64
             use_cross: false
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             name: rubot-macos-amd64
             use_cross: false
           - target: x86_64-pc-windows-msvc

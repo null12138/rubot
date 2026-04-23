@@ -5,9 +5,10 @@ Minimal autonomous AI agent in Rust: LLM + core tools + flat-file memory. A Thin
 ## Features
 
 - **LLM-agnostic** — works with any OpenAI-compatible API (OpenAI, Azure, Ollama, vLLM, LM Studio, etc.)
-- **Five built-in tools** — `web_search`, `web_fetch`, `code_exec`, `file_ops`, `latex_pdf`
+- **Built-in tools** — `web_search`, `web_fetch`, `code_exec`, `file_ops`, `latex_pdf`, plus `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_close`
 - **MD-backed tools** — drop a `.md` file in `workspace/tools/` to add new tools at runtime
 - **Flat-file memory** — three-layer Ebbinghaus-style memory (working / episodic / semantic)
+- **Child agents** — spawn background subagents for parallel work
 - **Multi-step plans** — LLM can emit a JSON plan that executes sequentially
 - **Loop mode** — drive a single task with a stop condition
 - **Heavy/fast model split** — first turn uses the heavy model, follow-ups use the fast model
@@ -125,7 +126,7 @@ workspace/
 
 Set `RUBOT_WORKSPACE` to an absolute path to customize the location.
 
-`file_ops` uses `workspace/files/` as the default base for bare relative paths like `foo.txt`, but you can also target `tools/...`, `memory/...`, `files/...`, or any absolute path that stays inside the configured workspace root.
+`file_ops` uses `workspace/files/` as the default base for bare relative paths like `foo.txt`, but you can also target `tools/...`, `memory/...`, `files/...`, or any absolute path on the host filesystem.
 
 ## REPL commands
 
@@ -155,6 +156,7 @@ src/
 ├── personality.rs   system prompt (OS-aware)
 ├── memory.rs        three-layer flat-file memory
 ├── planner.rs       multi-step chain executor
+├── subagent.rs      background child-agent manager
 ├── markdown.rs      terminal markdown rendering
 ├── llm/             OpenAI-compatible client + types
 └── tools/           registry + built-in tools + MD-backed tools

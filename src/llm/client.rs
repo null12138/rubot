@@ -1,7 +1,8 @@
+use super::types::*;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
+use std::time::Duration;
 use tracing::{debug, warn};
-use super::types::*;
 
 /// Turn an HTTP error body into a short, terminal-friendly message.
 /// - JSON `{error: {message}}` → just the message.
@@ -18,7 +19,9 @@ fn summarize_error_body(body: &str) -> String {
         let pick = |open: &str, close: &str| {
             lower.find(open).and_then(|s| {
                 let after = s + open.len();
-                lower[after..].find(close).map(|e| trimmed[after..after + e].trim().to_string())
+                lower[after..]
+                    .find(close)
+                    .map(|e| trimmed[after..after + e].trim().to_string())
             })
         };
         let headline = pick("<title>", "</title>")
@@ -26,8 +29,16 @@ fn summarize_error_body(body: &str) -> String {
             .unwrap_or_else(|| "HTML response (likely Cloudflare/WAF block)".into());
         return format!("{} — check your provider endpoint/IP", headline);
     }
-    let one_line: String = trimmed.chars().filter(|c| *c != '\n' && *c != '\r').take(200).collect();
-    if one_line.is_empty() { "(empty body)".into() } else { one_line }
+    let one_line: String = trimmed
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .take(200)
+        .collect();
+    if one_line.is_empty() {
+        "(empty body)".into()
+    } else {
+        one_line
+    }
 }
 
 pub struct LlmClient {
@@ -42,7 +53,7 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(url: &str, key: &str, model: &str, fast: &str, retries: u32) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_url: format!("{}/chat/completions", url.trim_end_matches('/')),
             api_key: key.into(),
             model: model.into(),
@@ -51,17 +62,35 @@ impl LlmClient {
         }
     }
 
-    pub fn update_model(&mut self, model: &str) { self.model = model.into(); }
+    pub fn update_model(&mut self, model: &str) {
+        self.model = model.into();
+    }
 
-    pub async fn chat(&self, msgs: &[Message], tools: Option<&[ToolDefinition]>, temp: Option<f32>) -> Result<ChatResponse> {
+    pub async fn chat(
+        &self,
+        msgs: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        temp: Option<f32>,
+    ) -> Result<ChatResponse> {
         self.exec(&self.model, msgs, tools, temp).await
     }
 
-    pub async fn chat_fast(&self, msgs: &[Message], tools: Option<&[ToolDefinition]>, temp: Option<f32>) -> Result<ChatResponse> {
+    pub async fn chat_fast(
+        &self,
+        msgs: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        temp: Option<f32>,
+    ) -> Result<ChatResponse> {
         self.exec(&self.fast_model, msgs, tools, temp).await
     }
 
-    async fn exec(&self, model: &str, msgs: &[Message], tools: Option<&[ToolDefinition]>, temp: Option<f32>) -> Result<ChatResponse> {
+    async fn exec(
+        &self,
+        model: &str,
+        msgs: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        temp: Option<f32>,
+    ) -> Result<ChatResponse> {
         let req = ChatRequest {
             model: model.into(),
             messages: msgs.to_vec(),
@@ -73,12 +102,20 @@ impl LlmClient {
 
         let mut last_err = None;
         for i in 0..=self.retries {
-            if i > 0 { tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(i-1))).await; }
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(i - 1))).await;
+            }
             match self.send(&req).await {
-                Ok(r) => { debug!("LLM {} ok", model); return Ok(r); }
+                Ok(r) => {
+                    debug!("LLM {} ok", model);
+                    return Ok(r);
+                }
                 Err(e) => {
                     let s = format!("{:#}", e);
-                    if ["429","500","502","503","timeout","connection"].iter().any(|&x| s.contains(x)) {
+                    if ["429", "500", "502", "503", "timeout", "connection"]
+                        .iter()
+                        .any(|&x| s.contains(x))
+                    {
                         warn!("Retry {}: {}", i, s);
                         last_err = Some(e);
                         continue;
@@ -91,15 +128,43 @@ impl LlmClient {
     }
 
     async fn send(&self, req: &ChatRequest) -> Result<ChatResponse> {
-        let res = self.client.post(&self.api_url)
+        let res = self
+            .client
+            .post(&self.api_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(req).send().await.context("API request failed")?;
+            .json(req)
+            .send()
+            .await
+            .context("API request failed")?;
 
         let status = res.status();
         let body = res.text().await.context("Read body failed")?;
         if !status.is_success() {
-            bail!("API error ({}): {}", status.as_u16(), summarize_error_body(&body));
+            bail!(
+                "API error ({}): {}",
+                status.as_u16(),
+                summarize_error_body(&body)
+            );
         }
         serde_json::from_str(&body).context("Parse JSON failed")
     }
+}
+
+fn build_http_client() -> Client {
+    let builder = Client::builder()
+        // Some proxy/CDN frontends close pooled TLS connections abruptly, which
+        // shows up in reqwest/rustls as unexpected EOF on reuse.
+        .pool_max_idle_per_host(0)
+        .http1_only()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .user_agent("rubot/0.1");
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.use_native_tls();
+
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.use_rustls_tls();
+
+    builder.build().unwrap_or_else(|_| Client::new())
 }

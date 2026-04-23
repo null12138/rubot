@@ -26,7 +26,7 @@ impl Tool for CodeExec {
         "code_exec"
     }
     fn description(&self) -> &str {
-        "Execute bash or python code in the sandbox (cwd is the configured workspace `files/` directory). Any files written there, or to absolute paths under it, are user-accessible and their absolute paths are returned to you — reference them by path, NEVER base64-encode."
+        "Run bash or python in workspace `files/`. If files are created, reference the returned absolute paths directly and never base64-encode them."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"lang": {"type": "string", "enum": ["bash", "python"]}, "code": {"type": "string"}}, "required": ["lang", "code"]})

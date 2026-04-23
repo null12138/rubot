@@ -25,14 +25,7 @@ impl FileOps {
         }
 
         if path.is_absolute() {
-            let rel = path.strip_prefix(&self.workspace).map_err(|_| {
-                anyhow!(
-                    "path '{}' is outside workspace '{}'",
-                    path.display(),
-                    self.workspace.display()
-                )
-            })?;
-            return Ok(normalize_under(&self.workspace, rel));
+            return Ok(path.to_path_buf());
         }
 
         let base = match path.components().next() {
@@ -72,7 +65,7 @@ impl Tool for FileOps {
         "file_ops"
     }
     fn description(&self) -> &str {
-        "Read, write, append, or list files in the workspace. Bare relative paths default to workspace `files/`; paths rooted at `files/`, `tools/`, or `memory/`, plus absolute paths inside the workspace, are also allowed."
+        "Read, write, append, or list files. Bare relative paths use workspace `files/`; `files/`, `tools/`, and `memory/` are workspace-rooted; absolute paths are allowed."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"act": {"type": "string", "enum": ["read", "write", "list", "append"]}, "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["act", "path"]})
@@ -169,11 +162,11 @@ mod tests {
     }
 
     #[test]
-    fn absolute_paths_outside_workspace_are_rejected() {
+    fn absolute_paths_are_allowed() {
         let workspace = temp_workspace();
         let ops = FileOps::new(&workspace);
-        let err = ops.p("/tmp/not-in-workspace.txt").unwrap_err().to_string();
-        assert!(err.contains("outside workspace"));
+        let path = ops.p("/tmp/not-in-workspace.txt").unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/tmp/not-in-workspace.txt"));
         let _ = std::fs::remove_dir_all(workspace);
     }
 }

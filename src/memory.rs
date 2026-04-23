@@ -4,16 +4,30 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MemoryLayer { Working, Episodic, Semantic }
+pub enum MemoryLayer {
+    Working,
+    Episodic,
+    Semantic,
+}
 
 impl MemoryLayer {
     pub fn dir(&self) -> &'static str {
-        match self { Self::Working => "working", Self::Episodic => "episodic", Self::Semantic => "semantic" }
+        match self {
+            Self::Working => "working",
+            Self::Episodic => "episodic",
+            Self::Semantic => "semantic",
+        }
     }
     pub fn prio(&self) -> u8 {
-        match self { Self::Semantic => 3, Self::Episodic => 2, Self::Working => 1 }
+        match self {
+            Self::Semantic => 3,
+            Self::Episodic => 2,
+            Self::Working => 1,
+        }
     }
-    pub fn all() -> [MemoryLayer; 3] { [Self::Semantic, Self::Episodic, Self::Working] }
+    pub fn all() -> [MemoryLayer; 3] {
+        [Self::Semantic, Self::Episodic, Self::Working]
+    }
     fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "working" => Some(Self::Working),
@@ -23,7 +37,11 @@ impl MemoryLayer {
         }
     }
     fn pretty(&self) -> &'static str {
-        match self { Self::Working => "Working", Self::Episodic => "Episodic", Self::Semantic => "Semantic" }
+        match self {
+            Self::Working => "Working",
+            Self::Episodic => "Episodic",
+            Self::Semantic => "Semantic",
+        }
     }
 }
 
@@ -41,7 +59,10 @@ pub struct IndexEntry {
 }
 
 #[derive(Default, Debug, Clone, Copy)]
-pub struct DecayReport { pub promoted: usize, pub evicted: usize }
+pub struct DecayReport {
+    pub promoted: usize,
+    pub evicted: usize,
+}
 
 #[derive(Default, Clone)]
 struct Frontmatter {
@@ -56,7 +77,11 @@ struct Frontmatter {
 
 impl Frontmatter {
     fn effective_last_reviewed(&self) -> &str {
-        if self.last_reviewed.is_empty() { &self.created } else { &self.last_reviewed }
+        if self.last_reviewed.is_empty() {
+            &self.created
+        } else {
+            &self.last_reviewed
+        }
     }
 }
 
@@ -66,7 +91,9 @@ pub struct MemorySearch {
 
 impl MemorySearch {
     pub fn new(workspace: &Path) -> Self {
-        Self { root: workspace.join("memory") }
+        Self {
+            root: workspace.join("memory"),
+        }
     }
 
     pub async fn add_memory(
@@ -95,11 +122,17 @@ impl MemorySearch {
     }
 
     pub async fn get_entry(&self, file: &str) -> Result<Option<String>> {
-        let Some(path) = self.resolve_id(file)? else { return Ok(None); };
+        let Some(path) = self.resolve_id(file)? else {
+            return Ok(None);
+        };
         let raw = fs::read_to_string(&path)?;
         let (mut fm, body) = parse_frontmatter(&raw);
         let layer = fm.layer.unwrap_or(MemoryLayer::Working);
-        let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("").to_string();
+        let fname = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+            .to_string();
 
         // Auto-touch: reading = rehearsal.
         fm.strength = fm.strength.saturating_add(1).min(MAX_STRENGTH);
@@ -109,7 +142,11 @@ impl MemorySearch {
         let _ = write_entry(&path, &fm, &body);
         let _ = self.rebuild_index();
 
-        let tags = if fm.tags.is_empty() { "(none)".into() } else { fm.tags.join(", ") };
+        let tags = if fm.tags.is_empty() {
+            "(none)".into()
+        } else {
+            fm.tags.join(", ")
+        };
         Ok(Some(format!(
             "# {}/{}\n\n**Summary:** {}\n**Layer:** {}\n**Strength:** {}/{} (reviews: {})\n**Tags:** {}\n**Created:** {}\n**Last reviewed:** {}\n\n---\n\n{}",
             layer.dir(), fname, fm.summary, layer.pretty(),
@@ -119,10 +156,14 @@ impl MemorySearch {
     }
 
     pub async fn touch(&self, file: &str) -> Result<bool> {
-        let Some(path) = self.resolve_id(file)? else { return Ok(false); };
+        let Some(path) = self.resolve_id(file)? else {
+            return Ok(false);
+        };
         let raw = fs::read_to_string(&path)?;
         let (mut fm, body) = parse_frontmatter(&raw);
-        if fm.layer.is_none() { fm.layer = infer_layer_from_path(&path); }
+        if fm.layer.is_none() {
+            fm.layer = infer_layer_from_path(&path);
+        }
         fm.strength = fm.strength.saturating_add(1).min(MAX_STRENGTH);
         fm.reviews = fm.reviews.saturating_add(1);
         fm.last_reviewed = Utc::now().to_rfc3339();
@@ -132,7 +173,9 @@ impl MemorySearch {
     }
 
     pub async fn delete_entry(&self, file: &str) -> Result<bool> {
-        let Some(path) = self.resolve_id(file)? else { return Ok(false); };
+        let Some(path) = self.resolve_id(file)? else {
+            return Ok(false);
+        };
         fs::remove_file(&path)?;
         self.rebuild_index()?;
         Ok(true)
@@ -142,7 +185,9 @@ impl MemorySearch {
         let mut n = 0usize;
         for layer in MemoryLayer::all() {
             let dir = self.root.join(layer.dir());
-            let Ok(read) = fs::read_dir(&dir) else { continue; };
+            let Ok(read) = fs::read_dir(&dir) else {
+                continue;
+            };
             for ent in read.flatten() {
                 let p = ent.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("md") {
@@ -158,22 +203,41 @@ impl MemorySearch {
     pub async fn get_index_text(&self) -> Result<String> {
         let entries = self.collect_sorted()?;
         let mut s = String::from("# Memory Index\n\n");
-        if entries.is_empty() { s.push_str("(empty)\n"); return Ok(s); }
+        if entries.is_empty() {
+            s.push_str("(empty)\n");
+            return Ok(s);
+        }
         for e in &entries {
-            let t = if e.tags.is_empty() { String::new() } else { format!(" [{}]", e.tags.join(", ")) };
-            s.push_str(&format!("- `{}` — {} (s{}){}\n", e.file, e.summary, e.strength, t));
+            let t = if e.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", e.tags.join(", "))
+            };
+            s.push_str(&format!(
+                "- `{}` — {} (s{}){}\n",
+                e.file, e.summary, e.strength, t
+            ));
         }
         Ok(s)
     }
 
     pub async fn quick_search(&self, query: &str) -> Result<Vec<IndexEntry>> {
-        let keywords: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
-        if keywords.is_empty() { return Ok(vec![]); }
-        let mut entries: Vec<IndexEntry> = self.scan_all()?
+        let keywords: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        if keywords.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut entries: Vec<IndexEntry> = self
+            .scan_all()?
             .into_iter()
             .filter(|(_, _, fm)| {
                 let s = fm.summary.to_lowercase();
-                keywords.iter().any(|kw| s.contains(kw) || fm.tags.iter().any(|t| t.to_lowercase().contains(kw)))
+                keywords.iter().any(|kw| {
+                    s.contains(kw) || fm.tags.iter().any(|t| t.to_lowercase().contains(kw))
+                })
             })
             .map(|(p, l, fm)| to_index_entry(&p, l, &fm))
             .collect();
@@ -184,13 +248,16 @@ impl MemorySearch {
     /// Entries where now - last_reviewed > DUE_HOURS[strength]h, sorted most-overdue first.
     pub async fn due(&self) -> Result<Vec<IndexEntry>> {
         let now = Utc::now();
-        let mut with_age: Vec<(i64, IndexEntry)> = self.scan_all()?
+        let mut with_age: Vec<(i64, IndexEntry)> = self
+            .scan_all()?
             .into_iter()
             .filter_map(|(p, l, fm)| {
                 let last = parse_dt(fm.effective_last_reviewed())?;
                 let age = (now - last).num_hours();
                 let due = DUE_HOURS[fm.strength.min(MAX_STRENGTH) as usize];
-                if age <= due { return None; }
+                if age <= due {
+                    return None;
+                }
                 Some((age - due, to_index_entry(&p, l, &fm)))
             })
             .collect();
@@ -217,7 +284,11 @@ impl MemorySearch {
             };
 
             if let Some(nl) = promote_to {
-                let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("").to_string();
+                let fname = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 let new_path = self.root.join(nl.dir()).join(&fname);
                 let raw = fs::read_to_string(&path)?;
                 let (_, body) = parse_frontmatter(&raw);
@@ -243,12 +314,20 @@ impl MemorySearch {
         let mut out = Vec::new();
         for layer in MemoryLayer::all() {
             let dir = self.root.join(layer.dir());
-            let Ok(read) = fs::read_dir(&dir) else { continue; };
+            let Ok(read) = fs::read_dir(&dir) else {
+                continue;
+            };
             for ent in read.flatten() {
                 let path = ent.path();
-                if !path.is_file() { continue; }
-                if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
-                let Ok(raw) = fs::read_to_string(&path) else { continue; };
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(raw) = fs::read_to_string(&path) else {
+                    continue;
+                };
                 let (fm, _) = parse_frontmatter(&raw);
                 out.push((path, layer, fm));
             }
@@ -257,7 +336,8 @@ impl MemorySearch {
     }
 
     fn collect_sorted(&self) -> Result<Vec<IndexEntry>> {
-        let mut entries: Vec<IndexEntry> = self.scan_all()?
+        let mut entries: Vec<IndexEntry> = self
+            .scan_all()?
             .into_iter()
             .map(|(p, l, fm)| to_index_entry(&p, l, &fm))
             .collect();
@@ -267,17 +347,27 @@ impl MemorySearch {
 
     fn rebuild_index(&self) -> Result<()> {
         let entries = self.collect_sorted()?;
-        let mut s = String::from("# Memory Index\n\n<!-- auto-generated; do not edit by hand -->\n\n");
+        let mut s =
+            String::from("# Memory Index\n\n<!-- auto-generated; do not edit by hand -->\n\n");
         if entries.is_empty() {
             s.push_str("(empty)\n");
         } else {
             for layer in MemoryLayer::all() {
                 let in_layer: Vec<_> = entries.iter().filter(|e| e.layer == layer).collect();
-                if in_layer.is_empty() { continue; }
+                if in_layer.is_empty() {
+                    continue;
+                }
                 s.push_str(&format!("## {}\n\n", layer.pretty()));
                 for e in in_layer {
-                    let t = if e.tags.is_empty() { String::new() } else { format!(" [{}]", e.tags.join(", ")) };
-                    s.push_str(&format!("- `{}` — {} (s{}){}\n", e.file, e.summary, e.strength, t));
+                    let t = if e.tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", e.tags.join(", "))
+                    };
+                    s.push_str(&format!(
+                        "- `{}` — {} (s{}){}\n",
+                        e.file, e.summary, e.strength, t
+                    ));
                 }
                 s.push('\n');
             }
@@ -288,7 +378,9 @@ impl MemorySearch {
 
     fn resolve_id(&self, input: &str) -> Result<Option<PathBuf>> {
         let stripped = input.trim().strip_suffix(".md").unwrap_or(input.trim());
-        if stripped.is_empty() { return Ok(None); }
+        if stripped.is_empty() {
+            return Ok(None);
+        }
 
         if let Some((l, fname)) = stripped.split_once('/') {
             let p = self.root.join(l).join(format!("{}.md", fname));
@@ -298,10 +390,14 @@ impl MemorySearch {
         let mut matches: Vec<PathBuf> = Vec::new();
         for layer in MemoryLayer::all() {
             let dir = self.root.join(layer.dir());
-            let Ok(read) = fs::read_dir(&dir) else { continue; };
+            let Ok(read) = fs::read_dir(&dir) else {
+                continue;
+            };
             for ent in read.flatten() {
                 let fname = ent.file_name().to_string_lossy().to_string();
-                if !fname.ends_with(".md") { continue; }
+                if !fname.ends_with(".md") {
+                    continue;
+                }
                 let stem = &fname[..fname.len() - 3];
                 if stem == stripped {
                     return Ok(Some(ent.path()));
@@ -317,7 +413,8 @@ impl MemorySearch {
         }
 
         if matches.len() > 1 {
-            let names: Vec<_> = matches.iter()
+            let names: Vec<_> = matches
+                .iter()
                 .filter_map(|p| p.file_name().and_then(|f| f.to_str()).map(String::from))
                 .collect();
             bail!("ambiguous prefix, matches: {}", names.join(", "));
@@ -338,11 +435,18 @@ fn to_index_entry(path: &Path, layer: MemoryLayer, fm: &Frontmatter) -> IndexEnt
 }
 
 fn sort_entries(v: &mut [IndexEntry]) {
-    v.sort_by(|a, b| b.layer.prio().cmp(&a.layer.prio()).then_with(|| b.file.cmp(&a.file)));
+    v.sort_by(|a, b| {
+        b.layer
+            .prio()
+            .cmp(&a.layer.prio())
+            .then_with(|| b.file.cmp(&a.file))
+    });
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, content)?;
     fs::rename(&tmp, path)?;
@@ -376,10 +480,15 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
         return (fm, content.to_string());
     };
     let header = &rest[..end];
-    let body = rest[end..].trim_start_matches("\n---").trim_start_matches('\n').to_string();
+    let body = rest[end..]
+        .trim_start_matches("\n---")
+        .trim_start_matches('\n')
+        .to_string();
 
     for line in header.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue; };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let key = k.trim().to_lowercase();
         let val = v.trim();
         match key.as_str() {
@@ -391,7 +500,8 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
             "last_reviewed" => fm.last_reviewed = val.to_string(),
             "tags" => {
                 let inner = val.trim_start_matches('[').trim_end_matches(']');
-                fm.tags = inner.split(',')
+                fm.tags = inner
+                    .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
@@ -403,7 +513,9 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
 }
 
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
 }
 
 fn infer_layer_from_path(p: &Path) -> Option<MemoryLayer> {

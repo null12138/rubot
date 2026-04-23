@@ -34,7 +34,9 @@ pub fn render(md: &str) -> String {
         if is_table_row(line) && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
             let start = i;
             let mut end = i + 2;
-            while end < lines.len() && is_table_row(lines[end]) { end += 1; }
+            while end < lines.len() && is_table_row(lines[end]) {
+                end += 1;
+            }
             out.push_str(&render_table(&lines[start..end]));
             i = end;
             continue;
@@ -48,8 +50,12 @@ pub fn render(md: &str) -> String {
 
 fn render_line(line: &str) -> String {
     for (prefix, style) in [
-        ("###### ", BOLD), ("##### ", BOLD), ("#### ", BOLD),
-        ("### ", BOLD), ("## ", H2), ("# ", H1),
+        ("###### ", BOLD),
+        ("##### ", BOLD),
+        ("#### ", BOLD),
+        ("### ", BOLD),
+        ("## ", H2),
+        ("# ", H1),
     ] {
         if let Some(rest) = line.strip_prefix(prefix) {
             return format!("{}{}{}", style, render_inline(rest), R);
@@ -61,7 +67,10 @@ fn render_line(line: &str) -> String {
     if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
         return format!("  • {}", render_inline(rest));
     }
-    if let Some(rest) = line.strip_prefix("  - ").or_else(|| line.strip_prefix("  * ")) {
+    if let Some(rest) = line
+        .strip_prefix("  - ")
+        .or_else(|| line.strip_prefix("  * "))
+    {
         return format!("    ◦ {}", render_inline(rest));
     }
     let t = line.trim();
@@ -102,7 +111,9 @@ fn render_inline(line: &str) -> String {
 fn find_double(chars: &[char], start: usize, ch: char) -> Option<usize> {
     let mut j = start;
     while j + 1 < chars.len() {
-        if chars[j] == ch && chars[j + 1] == ch { return Some(j); }
+        if chars[j] == ch && chars[j + 1] == ch {
+            return Some(j);
+        }
         j += 1;
     }
     None
@@ -115,7 +126,9 @@ fn is_table_row(line: &str) -> bool {
 
 fn is_table_separator(line: &str) -> bool {
     let t = line.trim();
-    if !t.starts_with('|') || !t.ends_with('|') { return false; }
+    if !t.starts_with('|') || !t.ends_with('|') {
+        return false;
+    }
     t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t')) && t.contains('-')
 }
 
@@ -141,13 +154,19 @@ fn is_wide(c: char) -> bool {
 fn render_table(rows: &[&str]) -> String {
     let header = split_row(rows[0]);
     let data: Vec<Vec<String>> = rows.iter().skip(2).map(|r| split_row(r)).collect();
-    let n_cols = header.len().max(data.iter().map(|r| r.len()).max().unwrap_or(0));
+    let n_cols = header
+        .len()
+        .max(data.iter().map(|r| r.len()).max().unwrap_or(0));
 
     let mut widths = vec![0usize; n_cols];
-    for (i, h) in header.iter().enumerate() { widths[i] = widths[i].max(display_width(h)); }
+    for (i, h) in header.iter().enumerate() {
+        widths[i] = widths[i].max(display_width(h));
+    }
     for row in &data {
         for (i, c) in row.iter().enumerate() {
-            if i < n_cols { widths[i] = widths[i].max(display_width(c)); }
+            if i < n_cols {
+                widths[i] = widths[i].max(display_width(c));
+            }
         }
     }
 
@@ -167,7 +186,9 @@ fn render_table(rows: &[&str]) -> String {
     s.push_str(&render_table_row(&header, &widths, true));
     s.push_str(&make_sep("├", "┼", "┤"));
     s.push('\n');
-    for row in &data { s.push_str(&render_table_row(row, &widths, false)); }
+    for row in &data {
+        s.push_str(&render_table_row(row, &widths, false));
+    }
     s.push_str(&make_sep("└", "┴", "┘"));
     s.push('\n');
     s

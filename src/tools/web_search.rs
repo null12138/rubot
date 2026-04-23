@@ -1,7 +1,7 @@
+use super::registry::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use scraper::{Html, Selector};
-use super::registry::{Tool, ToolResult};
 
 static UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -43,7 +43,7 @@ impl Tool for WebSearch {
         "web_search"
     }
     fn description(&self) -> &str {
-        "Search the web via Bing (forced US/English region)."
+        "Search the web via Bing in US English."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}, "max": {"type": "integer"}}, "required": ["query"]})
@@ -97,12 +97,7 @@ impl Tool for WebSearch {
                         .map(|e| e.text().collect::<String>())
                         .unwrap_or_default();
                     if !title.trim().is_empty() {
-                        results.push(format!(
-                            "[{}]({})\n{}",
-                            title.trim(),
-                            link,
-                            snippet.trim()
-                        ));
+                        results.push(format!("[{}]({})\n{}", title.trim(), link, snippet.trim()));
                     }
                 }
             }

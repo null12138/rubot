@@ -5,6 +5,7 @@ mod markdown;
 mod memory;
 mod personality;
 mod planner;
+mod subagent;
 mod tools;
 
 use config::Config;
@@ -260,8 +261,14 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                         }
                         "/model" => {
                             if parts.len() > 1 {
-                                rt.block_on(async { agent.lock().await.set_model(parts[1]) });
-                                println!("model set to {}", parts[1]);
+                                match rt.block_on(async {
+                                    agent.lock().await.set_model(parts[1]).await
+                                }) {
+                                    Ok(()) => println!("model set to {}", parts[1]),
+                                    Err(e) => {
+                                        eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e)
+                                    }
+                                }
                             } else {
                                 let (h, f) = rt.block_on(async { agent.lock().await.get_models() });
                                 println!("heavy={} fast={}", h, f);

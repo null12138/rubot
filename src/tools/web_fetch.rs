@@ -1,6 +1,6 @@
+use super::registry::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
-use super::registry::{Tool, ToolResult};
 use std::time::Duration;
 
 static UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -9,15 +9,21 @@ pub struct WebFetch;
 
 #[async_trait]
 impl Tool for WebFetch {
-    fn name(&self) -> &str { "web_fetch" }
-    fn description(&self) -> &str { "Fetch a URL and return text content." }
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+    fn description(&self) -> &str {
+        "Fetch a URL as text."
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"url": {"type": "string"}, "max": {"type": "integer"}}, "required": ["url"]})
     }
 
     async fn execute(&self, params: serde_json::Value) -> Result<ToolResult> {
         let mut url = params["url"].as_str().unwrap_or("").trim().to_string();
-        if !url.starts_with("http") { url = format!("https://{}", url); }
+        if !url.starts_with("http") {
+            url = format!("https://{}", url);
+        }
         let max = params["max"].as_u64().unwrap_or(10000) as usize;
 
         let client = reqwest::Client::builder()
@@ -28,7 +34,12 @@ impl Tool for WebFetch {
 
         let res = match client.get(&url).send().await {
             Ok(r) => r,
-            Err(_) => client.get(url.replace("https://", "http://")).send().await?,
+            Err(_) => {
+                client
+                    .get(url.replace("https://", "http://"))
+                    .send()
+                    .await?
+            }
         };
         let body = res.text().await?;
 
@@ -41,6 +52,10 @@ impl Tool for WebFetch {
         };
 
         let truncated: String = text.chars().take(max).collect();
-        Ok(ToolResult::ok(if text.chars().count() > max { format!("{}\n\n[TRUNCATED]", truncated) } else { truncated }))
+        Ok(ToolResult::ok(if text.chars().count() > max {
+            format!("{}\n\n[TRUNCATED]", truncated)
+        } else {
+            truncated
+        }))
     }
 }

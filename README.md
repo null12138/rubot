@@ -34,24 +34,81 @@ Download the latest release for your platform from [GitHub Releases](https://git
 ```bash
 tar xzf rubot-linux-amd64.tar.gz
 sudo mv rubot /usr/local/bin/
+rubot --version
 ```
 
 **Windows:**
 
-Extract `rubot.exe` from the zip and place it somewhere on your PATH.
+Extract `rubot.exe` from the zip and place it somewhere on your PATH, then run:
 
-### One-line install
+```powershell
+rubot --version
+```
+
+### Install from the current checkout
+
+If you already cloned this repo, the installer auto-detects the local source tree and installs from `target/release`:
+
+```bash
+./install.sh
+./install.sh update
+./install.sh uninstall
+```
+
+### One-line install / update / uninstall
 
 **Linux / macOS:**
 
 ```bash
+# Install
 curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash
+
+# Update in place
+curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash -s -- update
+
+# Uninstall
+curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash -s -- uninstall
+```
+
+If you want to force a source install from a local checkout:
+
+```bash
+./install.sh --source
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
+# Install
 irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+
+# Update
+$env:RUBOT_INSTALL_ACTION='update'
+irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+
+# Uninstall
+$env:RUBOT_INSTALL_ACTION='uninstall'
+irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+
+# Optional cleanup for the current shell
+Remove-Item Env:RUBOT_INSTALL_ACTION -ErrorAction SilentlyContinue
+```
+
+### Custom install location
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | \
+  RUBOT_INSTALL_DIR="$HOME/.local/bin" bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+$env:RUBOT_INSTALL_DIR="$HOME\AppData\Local\rubot\bin"
+irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+Remove-Item Env:RUBOT_INSTALL_DIR -ErrorAction SilentlyContinue
 ```
 
 ### Build from source
@@ -60,6 +117,7 @@ irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
 git clone https://github.com/opener/rubot.git
 cd rubot
 cargo build --release
+./target/release/rubot --version
 ./target/release/rubot
 ```
 
@@ -90,10 +148,11 @@ All settings via environment variables (`.env` file in the working directory):
 ### Quick setup
 
 ```bash
-cp .env.example .env
-# Edit .env with your API key and endpoint
-$EDITOR .env
 rubot
+# Then inside rubot:
+/config set api_base_url https://api.openai.com/v1
+/config set api_key sk-...
+/config set model gpt-4o
 ```
 
 ### Local models

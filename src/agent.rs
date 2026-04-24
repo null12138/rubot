@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::config::{self, Config, ConfigKey};
@@ -21,12 +23,14 @@ pub struct Agent {
     tools: ToolRegistry,
     memory: MemorySearch,
     messages: Vec<Message>,
+    current_request: Option<String>,
     iteration_count: u32,
     max_iterations: u32,
     last_plan: Option<String>,
     subagents: SubagentManager,
     history_summary: Option<String>,
     is_subagent: bool,
+    restored_session_messages: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +51,15 @@ struct ExecutedTool {
 #[derive(Debug, Clone, Default)]
 struct ToolRoundReport {
     entries: Vec<ExecutedTool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionSnapshot {
+    version: u32,
+    saved_at: String,
+    history_summary: Option<String>,
+    current_request: Option<String>,
+    messages: Vec<Message>,
 }
 
 impl ToolRoundReport {
@@ -138,28 +151,34 @@ impl Agent {
     pub async fn new(config: Config) -> Result<Self> {
         let (llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
 
-        Ok(Self {
+        let agent = Self {
             config,
             llm,
             tools,
             memory,
             messages: prompt_messages,
+            current_request: None,
             iteration_count: 0,
             max_iterations: 30,
             last_plan: None,
             subagents: SubagentManager::new(),
             history_summary: None,
             is_subagent: false,
-        })
+            restored_session_messages: 0,
+        };
+        agent.restore_session()
     }
 
     pub async fn process(&mut self, input: &str) -> Result<String> {
+        self.current_request = Some(input.trim().to_string());
         self.messages.push(Message::user(input));
         self.iteration_count = 0;
-        if should_auto_plan_mode(input) {
-            return self.run_plan_mode(None).await;
-        }
-        self.run_loop().await
+        let result = if should_auto_plan_mode(input) {
+            self.run_plan_mode(None).await
+        } else {
+            self.run_loop().await
+        };
+        result
     }
 
     async fn run_loop(&mut self) -> Result<String> {
@@ -673,10 +692,12 @@ impl Agent {
         self.memory = memory;
         self.last_plan = None;
         self.history_summary = None;
+        self.restored_session_messages = 0;
 
         if workspace_changed {
             self.messages.clear();
             self.messages.extend(prompt_messages);
+            self.current_request = None;
         } else {
             self.replace_prefix_messages(prompt_messages);
         }
@@ -750,7 +771,12 @@ impl Agent {
     }
 
     fn build_nonconverged_response(&self, reason: &str, rounds: &[ToolRoundReport]) -> String {
-        build_nonconverged_response_from_messages(&self.messages, reason, rounds)
+        build_nonconverged_response_from_messages(
+            &self.messages,
+            self.current_request.as_deref(),
+            reason,
+            rounds,
+        )
     }
 
     async fn maybe_spawn_stall_diagnostic_subagent(
@@ -811,7 +837,24 @@ impl Agent {
         &self.memory
     }
 
+    pub fn restored_session_messages(&self) -> usize {
+        self.restored_session_messages
+    }
+
+    pub async fn clear_conversation(&mut self) -> Result<()> {
+        let prompt_messages = Self::build_prompt_messages(&self.memory, &self.config).await?;
+        self.messages = prompt_messages;
+        self.current_request = None;
+        self.history_summary = None;
+        self.last_plan = None;
+        self.iteration_count = 0;
+        self.restored_session_messages = 0;
+        let _ = clear_session_snapshot_file(&self.config.workspace_path);
+        Ok(())
+    }
+
     pub async fn shutdown(&mut self) {
+        let _ = self.persist_session_snapshot();
         self.subagents.abort_all().await;
         if let Ok(r) = self.memory.decay().await {
             if r.promoted + r.evicted > 0 {
@@ -827,16 +870,20 @@ impl Agent {
         }
 
         let first_user = self
-            .messages
-            .iter()
-            .find(|m| {
-                m.role == Role::User
-                    && m.content.as_deref().is_some_and(|c| {
-                        let trimmed = c.trim();
-                        !trimmed.is_empty() && !is_internal_control_message(trimmed)
+            .current_request
+            .clone()
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .find(|m| {
+                        m.role == Role::User
+                            && m.content.as_deref().is_some_and(|c| {
+                                let trimmed = c.trim();
+                                !trimmed.is_empty() && !is_internal_control_message(trimmed)
+                            })
                     })
+                    .and_then(|m| m.content.clone())
             })
-            .and_then(|m| m.content.clone())
             .unwrap_or_default();
         let last_assistant = self
             .messages
@@ -869,6 +916,52 @@ impl Agent {
             .add_memory(MemoryLayer::Working, &summary, &body, &["session"])
             .await;
     }
+
+    fn restore_session(mut self) -> Result<Self> {
+        let Some(snapshot) = load_session_snapshot(&self.config.workspace_path)? else {
+            return Ok(self);
+        };
+
+        self.history_summary = snapshot.history_summary;
+        self.current_request = snapshot.current_request;
+        self.restored_session_messages = snapshot.messages.len();
+        self.messages.extend(
+            snapshot
+                .messages
+                .into_iter()
+                .filter(|message| message.role != Role::System),
+        );
+        Ok(self)
+    }
+
+    fn persist_session_snapshot(&self) -> Result<()> {
+        if self.is_subagent {
+            return Ok(());
+        }
+
+        let messages = self
+            .messages
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .cloned()
+            .collect::<Vec<_>>();
+        if messages.is_empty() && self.history_summary.is_none() {
+            return clear_session_snapshot_file(&self.config.workspace_path);
+        }
+
+        let snapshot = SessionSnapshot {
+            version: 1,
+            saved_at: chrono::Utc::now().to_rfc3339(),
+            history_summary: self.history_summary.clone(),
+            current_request: self.current_request.clone(),
+            messages,
+        };
+        fs::write(
+            session_snapshot_path(&self.config.workspace_path),
+            serde_json::to_vec_pretty(&snapshot)?,
+        )?;
+        Ok(())
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -897,6 +990,37 @@ fn compact_memory_index(memory_index: &str) -> String {
         "{}\n\n...(memory index truncated for token efficiency)...",
         truncate(memory_index, MAX_MEMORY_INDEX_CHARS)
     )
+}
+
+fn session_snapshot_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".rubot_session.json")
+}
+
+fn clear_session_snapshot_file(workspace_root: &Path) -> Result<()> {
+    let path = session_snapshot_path(workspace_root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn load_session_snapshot(workspace_root: &Path) -> Result<Option<SessionSnapshot>> {
+    let path = session_snapshot_path(workspace_root);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    let snapshot = match serde_json::from_str::<SessionSnapshot>(&raw) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            clear_session_snapshot_file(workspace_root)?;
+            return Ok(None);
+        }
+    };
+    Ok(Some(snapshot))
 }
 
 fn total_message_chars(messages: &[Message]) -> usize {
@@ -1023,15 +1147,19 @@ fn build_stall_recovery_prompt(repeated: &[String], auto_subagent_id: Option<&st
 
 fn build_nonconverged_response_from_messages(
     messages: &[Message],
+    explicit_request: Option<&str>,
     reason: &str,
     rounds: &[ToolRoundReport],
 ) -> String {
-    let request = messages
-        .iter()
-        .find_map(|message| {
-            (message.role == Role::User)
-                .then(|| message.content.as_deref().unwrap_or("").trim())
-                .filter(|content| !content.is_empty() && !is_internal_control_message(content))
+    let request = explicit_request
+        .map(str::trim)
+        .filter(|content| !content.is_empty() && !is_internal_control_message(content))
+        .or_else(|| {
+            messages.iter().find_map(|message| {
+                (message.role == Role::User)
+                    .then(|| message.content.as_deref().unwrap_or("").trim())
+                    .filter(|content| !content.is_empty() && !is_internal_control_message(content))
+            })
         })
         .unwrap_or("Unknown request");
 
@@ -1388,11 +1516,15 @@ fn format_subagent_snapshot(snapshot: &SubagentSnapshot) -> String {
 mod tests {
     use super::{
         build_nonconverged_response_from_messages, build_stall_recovery_prompt,
-        compact_memory_index, extract_task_complete, repeated_failure_signatures,
-        should_auto_plan_mode, summarize_messages, ExecutedTool, ToolAttempt, ToolRoundReport,
+        clear_session_snapshot_file, compact_memory_index, extract_task_complete,
+        repeated_failure_signatures, session_snapshot_path, should_auto_plan_mode,
+        summarize_messages, ExecutedTool, ToolAttempt, ToolRoundReport,
     };
+    use crate::config::Config;
     use crate::llm::types::{FunctionCall, Message, Role, ToolCall};
     use crate::tools::registry::ToolResult;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn complex_requests_enter_auto_plan_mode() {
@@ -1494,6 +1626,7 @@ mod tests {
 
         let summary = build_nonconverged_response_from_messages(
             &messages,
+            None,
             "Reached maximum iterations (30) without converging.",
             &rounds,
         );
@@ -1502,6 +1635,49 @@ mod tests {
         assert!(summary.contains("Progress made:"));
         assert!(summary.contains("Current blockers:"));
         assert!(summary.contains("subagent_spawn"));
+    }
+
+    #[tokio::test]
+    async fn agent_restores_persisted_session_snapshot() {
+        let workspace = temp_workspace();
+        let config = test_config(&workspace);
+        std::fs::write(
+            session_snapshot_path(&workspace),
+            r#"{"version":1,"saved_at":"2026-01-01T00:00:00Z","history_summary":"x","current_request":"keep going","messages":[{"role":"user","content":"old","tool_calls":null,"tool_call_id":null}]}"#,
+        )
+        .unwrap();
+
+        let restored = crate::agent::Agent::new(config).await.unwrap();
+        assert_eq!(restored.restored_session_messages(), 1);
+        assert_eq!(restored.history_summary.as_deref(), Some("x"));
+        assert_eq!(restored.current_request.as_deref(), Some("keep going"));
+        assert!(restored
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("old")));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn nonconverged_response_uses_explicit_request() {
+        let summary = build_nonconverged_response_from_messages(
+            &[Message::user("Plan cycle 2 complete.")],
+            Some("继续 ssrn 爬取任务"),
+            "Reached maximum iterations (30) without converging.",
+            &[],
+        );
+        assert!(summary.contains("继续 ssrn 爬取任务"));
+        assert!(!summary.contains("Unknown request"));
+    }
+
+    #[test]
+    fn clear_session_snapshot_is_idempotent() {
+        let workspace = temp_workspace();
+        clear_session_snapshot_file(&workspace).unwrap();
+        std::fs::write(session_snapshot_path(&workspace), "{}").unwrap();
+        clear_session_snapshot_file(&workspace).unwrap();
+        assert!(!session_snapshot_path(&workspace).exists());
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     fn failed_tool(name: &str, summary: &str, preview: &str) -> ExecutedTool {
@@ -1533,6 +1709,37 @@ mod tests {
                 success,
                 preview: preview.into(),
             },
+        }
+    }
+
+    fn temp_workspace() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        dir.push(format!(
+            "rubot-agent-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        std::fs::create_dir_all(dir.join("memory/working")).unwrap();
+        std::fs::create_dir_all(dir.join("memory/episodic")).unwrap();
+        std::fs::create_dir_all(dir.join("memory/semantic")).unwrap();
+        dir
+    }
+
+    fn test_config(workspace: &PathBuf) -> Config {
+        Config {
+            api_base_url: "https://example.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-test".into(),
+            fast_model: "gpt-test-fast".into(),
+            workspace_path: workspace.clone(),
+            max_retries: 0,
+            code_exec_timeout_secs: 30,
         }
     }
 }

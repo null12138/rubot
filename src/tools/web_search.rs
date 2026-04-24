@@ -1,11 +1,26 @@
 use super::registry::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
+use reqwest::Url;
 use scraper::{Html, Selector};
 
 static UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const MAX_CANDIDATES: usize = 20;
 
 pub struct WebSearch;
+
+#[derive(Debug, Clone)]
+struct SearchCandidate {
+    title: String,
+    link: String,
+    snippet: String,
+    host: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchConstraints {
+    required_hosts: Vec<String>,
+}
 
 /// Unwrap Bing's click-tracking wrapper of the form
 /// `https://www.bing.com/ck/a?!&&p=...&u=a1<BASE64URL>&ntb=1&...`
@@ -15,13 +30,10 @@ fn decode_bing_url(raw: &str) -> String {
     let decoded: String = urlencoding::decode(&normalized)
         .map(|s| s.into_owned())
         .unwrap_or(normalized);
-    if let Some(idx) = decoded.find("&u=") {
+    if let Some(encoded) = extract_bing_u_param(&decoded) {
         // Trim to the next `&` — Bing appends more query params after the
         // base64 payload (`&ntb=1&...`) and the old decoder was trying to
         // base64-decode the whole tail, silently failing every time.
-        let tail = &decoded[idx + 3..];
-        let end = tail.find('&').unwrap_or(tail.len());
-        let encoded = &tail[..end];
         let stripped = encoded.strip_prefix('a').unwrap_or(encoded);
         let stripped = stripped.strip_prefix('1').unwrap_or(stripped);
         if stripped.len() > 10 {
@@ -35,6 +47,13 @@ fn decode_bing_url(raw: &str) -> String {
         }
     }
     raw.into()
+}
+
+fn extract_bing_u_param(decoded: &str) -> Option<&str> {
+    let idx = decoded.find("?u=").or_else(|| decoded.find("&u="))?;
+    let tail = &decoded[idx + 3..];
+    let end = tail.find('&').unwrap_or(tail.len());
+    Some(&tail[..end])
 }
 
 #[async_trait]
@@ -83,8 +102,8 @@ impl Tool for WebSearch {
         let p_lineclamp = Selector::parse("p.b_lineclamp").unwrap();
         let p_any = Selector::parse("p").unwrap();
 
-        let mut results = vec![];
-        for r in doc.select(&algo).take(max) {
+        let mut candidates = vec![];
+        for r in doc.select(&algo).take(MAX_CANDIDATES) {
             if let Some(h) = r.select(&h2).next() {
                 if let Some(a) = h.select(&a_sel).next() {
                     let title = a.text().collect::<String>();
@@ -96,18 +115,229 @@ impl Tool for WebSearch {
                         .or_else(|| r.select(&p_any).next())
                         .map(|e| e.text().collect::<String>())
                         .unwrap_or_default();
-                    if !title.trim().is_empty() {
-                        results.push(format!("[{}]({})\n{}", title.trim(), link, snippet.trim()));
+                    if let Some(candidate) = build_candidate(title, link, snippet) {
+                        candidates.push(candidate);
                     }
                 }
             }
         }
+        let results = rank_candidates(q, candidates, max)
+            .into_iter()
+            .map(|item| format!("[{}]({})\n{}", item.title, item.link, item.snippet))
+            .collect::<Vec<_>>();
         Ok(ToolResult::ok(if results.is_empty() {
             "No results".into()
         } else {
             results.join("\n\n")
         }))
     }
+}
+
+fn build_candidate(title: String, link: String, snippet: String) -> Option<SearchCandidate> {
+    let title = squash_ws(&title);
+    let link = squash_ws(&link);
+    let snippet = squash_ws(&snippet);
+    if title.is_empty() || link.is_empty() {
+        return None;
+    }
+    let url = Url::parse(&link).ok()?;
+    let host = url
+        .host_str()?
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    if host.is_empty() || host.ends_with("bing.com") {
+        return None;
+    }
+    Some(SearchCandidate {
+        title,
+        link,
+        snippet,
+        host,
+    })
+}
+
+fn rank_candidates(
+    query: &str,
+    candidates: Vec<SearchCandidate>,
+    max: usize,
+) -> Vec<SearchCandidate> {
+    let query_tokens = tokenize(query);
+    let constraints = parse_constraints(query);
+    let ascii_query = is_mostly_ascii(query);
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let score = score_candidate(&candidate, &query_tokens, &constraints, ascii_query);
+            (score > -100).then_some((score, candidate))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.host.cmp(&b.1.host))
+            .then_with(|| a.1.title.cmp(&b.1.title))
+    });
+
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut out = Vec::new();
+    for (_, candidate) in scored {
+        let dedupe_key = format!(
+            "{}|{}",
+            candidate.host,
+            candidate.title.to_ascii_lowercase()
+        );
+        if seen.insert(dedupe_key) {
+            out.push(candidate);
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
+fn score_candidate(
+    candidate: &SearchCandidate,
+    query_tokens: &[String],
+    constraints: &SearchConstraints,
+    ascii_query: bool,
+) -> i32 {
+    let title = candidate.title.to_ascii_lowercase();
+    let snippet = candidate.snippet.to_ascii_lowercase();
+    let host = candidate.host.as_str();
+    let mut score = 0i32;
+
+    if !constraints.required_hosts.is_empty() {
+        if host_matches_required(host, &constraints.required_hosts) {
+            score += 120;
+        } else {
+            score -= 140;
+        }
+    }
+
+    for token in query_tokens {
+        if title.contains(token) {
+            score += 8;
+        }
+        if snippet.contains(token) {
+            score += 3;
+        }
+        if host.contains(token) {
+            score += 6;
+        }
+    }
+
+    if host.ends_with(".edu")
+        || host.ends_with(".gov")
+        || host.ends_with(".org")
+        || host.contains("ssrn.com")
+        || host.contains("arxiv.org")
+        || host.contains("github.com")
+    {
+        score += 8;
+    }
+
+    if is_low_quality_host(host) {
+        score -= if ascii_query { 60 } else { 15 };
+    }
+
+    if ascii_query && contains_cjk(&candidate.title) {
+        score -= 35;
+    }
+    if ascii_query && contains_cjk(&candidate.snippet) {
+        score -= 15;
+    }
+
+    if candidate.link.contains("/ck/a?") {
+        score -= 20;
+    }
+
+    score
+}
+
+fn parse_constraints(query: &str) -> SearchConstraints {
+    let required_hosts = query
+        .split_whitespace()
+        .filter_map(|part| {
+            let lower = part.to_ascii_lowercase();
+            let host = lower.strip_prefix("site:")?;
+            let host = host
+                .trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | ',' | ';'))
+                .trim_end_matches('.');
+            (!host.is_empty()).then(|| host.trim_start_matches("www.").to_string())
+        })
+        .collect();
+    SearchConstraints { required_hosts }
+}
+
+fn host_matches_required(host: &str, required_hosts: &[String]) -> bool {
+    required_hosts
+        .iter()
+        .any(|required| host == required || host.ends_with(&format!(".{}", required)))
+}
+
+fn is_low_quality_host(host: &str) -> bool {
+    [
+        "zhihu.com",
+        "zhuanlan.zhihu.com",
+        "zhidao.baidu.com",
+        "tieba.baidu.com",
+        "wenku.baidu.com",
+        "csdn.net",
+        "bilibili.com",
+        "xiaohongshu.com",
+        "weather.com.cn",
+        "btc123.fans",
+    ]
+    .iter()
+    .any(|suffix| host == *suffix || host.ends_with(&format!(".{}", suffix)))
+}
+
+fn tokenize(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 2)
+        .filter(|part| !is_search_operator(part))
+        .collect()
+}
+
+fn is_search_operator(token: &str) -> bool {
+    matches!(
+        token,
+        "site"
+            | "filetype"
+            | "intitle"
+            | "inurl"
+            | "related"
+            | "cache"
+            | "or"
+            | "and"
+            | "pdf"
+            | "www"
+            | "com"
+            | "org"
+            | "net"
+    )
+}
+
+fn is_mostly_ascii(text: &str) -> bool {
+    let chars = text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<Vec<_>>();
+    if chars.is_empty() {
+        return true;
+    }
+    let ascii = chars.iter().filter(|c| c.is_ascii()).count();
+    ascii * 100 / chars.len() >= 80
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|c| matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF | 0xAC00..=0xD7AF))
+}
+
+fn squash_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -126,6 +356,84 @@ mod tests {
         let encoded = data_encoding::BASE64URL.encode(b"https://example.com/");
         let raw = format!("https://www.bing.com/ck/a?!&&p=xx&u=a1{}&ntb=1", encoded);
         assert_eq!(decode_bing_url(&raw), "https://example.com/");
+    }
+
+    #[test]
+    fn bing_url_decoder_handles_query_prefix_u_param() {
+        let encoded = data_encoding::BASE64URL.encode(b"https://example.org/test");
+        let raw = format!("https://www.bing.com/ck/a?u=a1{}&ntb=1", encoded);
+        assert_eq!(decode_bing_url(&raw), "https://example.org/test");
+    }
+
+    #[test]
+    fn low_quality_cjk_results_are_filtered_for_ascii_queries() {
+        let candidates = vec![
+            SearchCandidate {
+                title: "文章被收到SSRN上会对后续投稿有影响吗? - 知乎".into(),
+                link: "https://www.zhihu.com/question/1".into(),
+                snippet: "中文问答聚合页".into(),
+                host: "zhihu.com".into(),
+            },
+            SearchCandidate {
+                title: "SSRN Search Results".into(),
+                link: "https://www.ssrn.com/en/search-results/".into(),
+                snippet: "Official SSRN search page".into(),
+                host: "ssrn.com".into(),
+            },
+        ];
+        let ranked = rank_candidates(
+            r#"SSRN "free download" PDF "abstract_id" "Delivery.cfm""#,
+            candidates,
+            5,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].host, "ssrn.com");
+    }
+
+    #[test]
+    fn chinese_queries_do_not_drop_chinese_results() {
+        let candidate = SearchCandidate {
+            title: "怎么查看以往的热搜？ - 知乎".into(),
+            link: "https://www.zhihu.com/question/2".into(),
+            snippet: "中文结果".into(),
+            host: "zhihu.com".into(),
+        };
+        let ranked = rank_candidates("怎么看热搜", vec![candidate], 5);
+        assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn site_constraint_prefers_matching_host() {
+        let ranked = rank_candidates(
+            r#"site:arxiv.org "artificial intelligence" 2025"#,
+            vec![
+                SearchCandidate {
+                    title: "Artificial Definition & Meaning".into(),
+                    link: "https://www.merriam-webster.com/dictionary/artificial".into(),
+                    snippet: "Dictionary page".into(),
+                    host: "merriam-webster.com".into(),
+                },
+                SearchCandidate {
+                    title: "cs.AI recent submissions".into(),
+                    link: "https://arxiv.org/list/cs.AI/recent".into(),
+                    snippet: "Recent arXiv submissions".into(),
+                    host: "arxiv.org".into(),
+                },
+            ],
+            5,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].host, "arxiv.org");
+    }
+
+    #[test]
+    fn tokenize_ignores_search_operators() {
+        let tokens = tokenize(r#"site:ssrn.com "free download" filetype:pdf OR abstract_id"#);
+        assert!(!tokens.contains(&"site".into()));
+        assert!(!tokens.contains(&"pdf".into()));
+        assert!(!tokens.contains(&"or".into()));
+        assert!(tokens.contains(&"ssrn".into()));
+        assert!(tokens.contains(&"abstract".into()));
     }
 
     /// Live hit against Bing. Not run by default (slow + network).

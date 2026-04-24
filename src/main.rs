@@ -15,6 +15,7 @@ use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::Helper;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -84,6 +85,18 @@ impl RubotHelper {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    match parse_startup_action(env::args().skip(1))? {
+        StartupAction::Help => {
+            print_help();
+            return Ok(());
+        }
+        StartupAction::Version => {
+            println!("rubot {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        StartupAction::Repl => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rubot=warn")),
@@ -95,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
     config.ensure_workspace_dirs()?;
     let agent = Arc::new(Mutex::new(agent::Agent::new(config).await?));
+    let restored_messages = agent.lock().await.restored_session_messages();
 
     println!(
         "{}rubot{} {}— /quit to exit · /loop <task>|<stop> to auto-loop{}",
@@ -103,9 +117,69 @@ async fn main() -> anyhow::Result<()> {
         markdown::DIM,
         markdown::R
     );
+    if restored_messages > 0 {
+        println!(
+            "{}[restored {} session messages]{}",
+            markdown::DIM,
+            restored_messages,
+            markdown::R
+        );
+    }
     let a = agent.clone();
     tokio::task::spawn_blocking(move || run_repl(a)).await??;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAction {
+    Repl,
+    Help,
+    Version,
+}
+
+fn parse_startup_action(args: impl IntoIterator<Item = String>) -> anyhow::Result<StartupAction> {
+    let mut args = args.into_iter();
+    match args.next().as_deref() {
+        None => Ok(StartupAction::Repl),
+        Some("-h" | "--help") => Ok(StartupAction::Help),
+        Some("-V" | "--version") => Ok(StartupAction::Version),
+        Some(other) => {
+            anyhow::bail!("unsupported argument: {other}\n\nRun `rubot --help` for usage.")
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        "\
+rubot {version}
+
+Usage:
+  rubot
+  rubot --help
+  rubot --version
+
+Description:
+  Terminal AI agent with built-in tools, memory, planning, and subagents.
+
+REPL commands:
+  /quit / /exit              Save session memory and exit
+  /clear                     Clear the conversation and screen
+  /memory                    Show memory index
+  /model [name]              Show or set the heavy model
+  /config                    List effective config and .env path
+  /config get <key>          Show one config value
+  /config set <key> <value>  Save config to .env and apply it
+  /plan                      Show the last executed plan
+  /loop <task>|<stop>        Auto-loop until stop condition
+
+Config:
+  Reads .env from the current working directory.
+  Common keys: RUBOT_API_BASE_URL, RUBOT_API_KEY, RUBOT_MODEL,
+  RUBOT_FAST_MODEL, RUBOT_WORKSPACE, RUBOT_MAX_RETRIES.
+",
+        version = env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
@@ -176,6 +250,17 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                             continue;
                         }
                         "/clear" => {
+                            match rt
+                                .block_on(async { agent.lock().await.clear_conversation().await })
+                            {
+                                Ok(()) => {}
+                                Err(e) => eprintln!(
+                                    "{}error:{} failed to clear conversation: {:#}",
+                                    markdown::RED,
+                                    markdown::R,
+                                    e
+                                ),
+                            }
                             print!("\x1b[2J\x1b[H");
                             continue;
                         }
@@ -467,8 +552,35 @@ fn should_store_repl_history(input: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{repl_history_path, should_store_repl_history};
+    use super::{
+        parse_startup_action, repl_history_path, should_store_repl_history, StartupAction,
+    };
     use std::path::Path;
+
+    #[test]
+    fn parse_startup_action_defaults_to_repl() {
+        assert_eq!(
+            parse_startup_action(Vec::<String>::new()).unwrap(),
+            StartupAction::Repl
+        );
+    }
+
+    #[test]
+    fn parse_startup_action_supports_help_and_version() {
+        assert_eq!(
+            parse_startup_action(vec!["--help".into()]).unwrap(),
+            StartupAction::Help
+        );
+        assert_eq!(
+            parse_startup_action(vec!["--version".into()]).unwrap(),
+            StartupAction::Version
+        );
+    }
+
+    #[test]
+    fn parse_startup_action_rejects_unknown_flags() {
+        assert!(parse_startup_action(vec!["--bogus".into()]).is_err());
+    }
 
     #[test]
     fn repl_history_is_workspace_scoped() {

@@ -1,76 +1,116 @@
 #Requires -Version 5.1
-param([string]$InstallDir = "$env:LOCALAPPDATA\rubot")
+param(
+    [ValidateSet("install", "update", "uninstall")]
+    [string]$Action = "",
+    [string]$InstallDir = ""
+)
 
 $ErrorActionPreference = "Stop"
 $Repo = "opener/rubot"
-$AssetPattern = "rubot-windows-amd64.zip"
+$AssetName = "rubot-windows-amd64.zip"
+$DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
 
-function Write-Step($msg) { Write-Host "`n===> $msg" -ForegroundColor Cyan }
+if ([string]::IsNullOrWhiteSpace($Action)) {
+    $Action = if ($env:RUBOT_INSTALL_ACTION) { $env:RUBOT_INSTALL_ACTION } else { "install" }
+}
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    $InstallDir = if ($env:RUBOT_INSTALL_DIR) { $env:RUBOT_INSTALL_DIR } else { "$env:LOCALAPPDATA\rubot\bin" }
+}
 
-# --- detect arch ---
+function Write-Step($Message) {
+    Write-Host "`n===> $Message" -ForegroundColor Cyan
+}
+
+function Update-UserPath($Dir, [bool]$Remove) {
+    $current = [Environment]::GetEnvironmentVariable("PATH", "User")
+    $parts = @()
+    if ($current) {
+        $parts = $current -split ";" | Where-Object { $_ -and $_ -ne $Dir }
+    }
+    if (-not $Remove) {
+        $parts += $Dir
+    }
+    $newPath = ($parts | Select-Object -Unique) -join ";"
+    [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+    $env:PATH = $newPath
+}
+
+if ($Action -eq "uninstall") {
+    $exePath = Join-Path $InstallDir "rubot.exe"
+    if (Test-Path $exePath) {
+        Remove-Item -Force $exePath
+        Write-Step "Removed $exePath"
+    } else {
+        Write-Warning "No installed rubot found at $exePath"
+    }
+
+    Update-UserPath -Dir $InstallDir -Remove $true
+
+    if ((Test-Path $InstallDir) -and -not (Get-ChildItem -Force $InstallDir | Select-Object -First 1)) {
+        Remove-Item -Force $InstallDir
+    }
+
+    Write-Host "rubot uninstall complete."
+    exit 0
+}
+
 if (-not [Environment]::Is64BitOperatingSystem) {
     Write-Error "rubot requires a 64-bit OS"
     exit 1
 }
 
-# --- find latest release ---
-Write-Step "Fetching latest release info..."
-$releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "rubot-installer" }
-$asset = $releases.assets | Where-Object { $_.name -eq $AssetPattern } | Select-Object -First 1
+Write-Step "Preparing installer for $AssetName"
 
-if (-not $asset) {
-    Write-Error "Could not find $AssetPattern in latest release"
-    exit 1
-}
-
-# --- download ---
 $tmpDir = Join-Path $env:TEMP "rubot-install-$(Get-Random)"
 New-Item -ItemType Directory -Path $tmpDir | Out-Null
 
-Write-Step "Downloading $($asset.name)..."
-$zipPath = Join-Path $tmpDir $asset.name
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+try {
+    Write-Step "Downloading $AssetName..."
+    $zipPath = Join-Path $tmpDir $AssetName
+    Invoke-WebRequest -Uri $DownloadUrl -Headers @{ "User-Agent" = "rubot-installer" } -OutFile $zipPath
 
-# --- extract ---
-Write-Step "Extracting..."
-Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
+    Write-Step "Extracting..."
+    Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
 
-# --- install ---
-if (-not (Test-Path $InstallDir)) {
-    New-Item -ItemType Directory -Path $InstallDir | Out-Null
+    $exe = Get-ChildItem -Path $tmpDir -Filter "rubot.exe" -Recurse | Select-Object -First 1
+    if (-not $exe) {
+        Write-Error "rubot.exe not found in archive"
+        exit 1
+    }
+
+    if (-not (Test-Path $InstallDir)) {
+        New-Item -ItemType Directory -Path $InstallDir | Out-Null
+    }
+
+    $Verb = if ($Action -eq "update") { "Updating" } else { "Installing" }
+    Write-Step "$Verb to $InstallDir"
+    Copy-Item $exe.FullName -Destination (Join-Path $InstallDir "rubot.exe") -Force
+
+    Update-UserPath -Dir $InstallDir -Remove $false
+
+    $versionOutput = & (Join-Path $InstallDir "rubot.exe") --version 2>$null
+    if ($versionOutput) {
+        Write-Step "Installed $versionOutput"
+    }
+
+    $python = Get-Command "python" -ErrorAction SilentlyContinue
+    if (-not $python) {
+        Write-Host "WARNING: python not found — code_exec may need it" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Step "Done."
+    Write-Host "  Run: rubot --version"
+    Write-Host "  Start: rubot"
+    Write-Host "  Configure inside rubot with:"
+    Write-Host "    /config set api_base_url <url>"
+    Write-Host "    /config set api_key <key>"
+    Write-Host "    /config set model <model>"
+    Write-Host ""
+    Write-Host "If PATH changed, restart the terminal."
 }
-
-$exe = Get-ChildItem -Path $tmpDir -Filter "rubot.exe" -Recurse | Select-Object -First 1
-if (-not $exe) {
-    Write-Error "rubot.exe not found in archive"
-    exit 1
+finally {
+    if (Test-Path $tmpDir) {
+        Remove-Item -Recurse -Force $tmpDir
+    }
 }
-
-Copy-Item $exe.FullName -Destination (Join-Path $InstallDir "rubot.exe") -Force
-
-# --- add to PATH ---
-$pathParts = $env:PATH -split ";" | Where-Object { $_ -ne $InstallDir }
-$newPath = ($pathParts + $InstallDir) -join ";"
-[Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
-$env:PATH = $newPath
-
-# --- cleanup ---
-Remove-Item -Recurse -Force $tmpDir
-
-# --- check prerequisites ---
-Write-Step "Checking prerequisites..."
-$python = Get-Command "python" -ErrorAction SilentlyContinue
-if (-not $python) {
-    Write-Host "  WARNING: python not found — code_exec tool requires it" -ForegroundColor Yellow
-    Write-Host "  Install: winget install Python.Python.3" -ForegroundColor Yellow
-}
-
-Write-Step "Setup complete!"
-Write-Host ""
-Write-Host "  rubot installed to: $InstallDir\rubot.exe"
-Write-Host ""
-Write-Host "  Next steps:"
-Write-Host "    1. Create .env:  copy .env.example .env  (then edit with your API key)"
-Write-Host "    2. Run rubot:    rubot"
-Write-Host ""
-Write-Host "  NOTE: Restart your terminal for PATH changes to take effect."

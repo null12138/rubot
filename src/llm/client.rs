@@ -6,6 +6,8 @@ use tracing::{debug, warn};
 
 const CONNECT_TIMEOUT_SECS: u64 = 20;
 const REQUEST_TIMEOUT_SECS: u64 = 180;
+const MIN_SILENT_LLM_RETRIES: u32 = 10;
+const MAX_RETRY_DELAY_MS: u64 = 8_000;
 
 /// Turn an HTTP error body into a short, terminal-friendly message.
 /// - JSON `{error: {message}}` → just the message.
@@ -45,7 +47,6 @@ fn summarize_error_body(body: &str) -> String {
 }
 
 pub struct LlmClient {
-    client: Client,
     api_url: String,
     api_key: String,
     pub model: String,
@@ -56,7 +57,6 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(url: &str, key: &str, model: &str, fast: &str, retries: u32) -> Self {
         Self {
-            client: build_http_client(),
             api_url: format!("{}/chat/completions", url.trim_end_matches('/')),
             api_key: key.into(),
             model: model.into(),
@@ -104,11 +104,13 @@ impl LlmClient {
         };
 
         let mut last_err = None;
-        for i in 0..=self.retries {
+        let retry_budget = self.retries.max(MIN_SILENT_LLM_RETRIES);
+        for i in 0..=retry_budget {
             if i > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(i - 1))).await;
+                tokio::time::sleep(Duration::from_millis(retry_delay_ms(i))).await;
             }
-            match self.send(&req).await {
+            let client = build_http_client();
+            match self.send(&client, &req).await {
                 Ok(r) => {
                     debug!("LLM {} ok", model);
                     return Ok(r);
@@ -116,7 +118,7 @@ impl LlmClient {
                 Err(e) => {
                     let s = format!("{:#}", e);
                     if is_retryable_llm_error(&e) {
-                        warn!("Retry {}: {}", i, s);
+                        warn!("Retry {}/{} for {}: {}", i + 1, retry_budget + 1, model, s);
                         last_err = Some(e);
                         continue;
                     }
@@ -136,9 +138,8 @@ impl LlmClient {
         bail!("Retries exhausted: {}", detail)
     }
 
-    async fn send(&self, req: &ChatRequest) -> Result<ChatResponse> {
-        let res = self
-            .client
+    async fn send(&self, client: &Client, req: &ChatRequest) -> Result<ChatResponse> {
+        let res = client
             .post(&self.api_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(req)
@@ -157,6 +158,11 @@ impl LlmClient {
         }
         serde_json::from_str(&body).context("Parse JSON failed")
     }
+}
+
+fn retry_delay_ms(attempt: u32) -> u64 {
+    let pow = attempt.saturating_sub(1).min(6);
+    (500 * 2u64.pow(pow)).min(MAX_RETRY_DELAY_MS)
 }
 
 fn build_http_client() -> Client {
@@ -200,6 +206,11 @@ fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
         "no route to host",
         "network is unreachable",
         "broken pipe",
+        "parse json failed",
+        "error decoding response body",
+        "eof while parsing",
+        "incomplete message",
+        "channel closed",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -216,7 +227,7 @@ fn looks_like_connectivity_timeout(detail: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_retryable_llm_error, looks_like_connectivity_timeout};
+    use super::{is_retryable_llm_error, looks_like_connectivity_timeout, retry_delay_ms};
 
     #[test]
     fn timed_out_connect_errors_are_retryable() {
@@ -232,5 +243,18 @@ mod tests {
         let err = anyhow::anyhow!("API error (400): bad request");
         assert!(!is_retryable_llm_error(&err));
         assert!(!looks_like_connectivity_timeout(&format!("{:#}", err)));
+    }
+
+    #[test]
+    fn malformed_provider_payloads_are_retryable() {
+        let err = anyhow::anyhow!("Parse JSON failed: EOF while parsing a value");
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn retry_delay_is_capped() {
+        assert_eq!(retry_delay_ms(1), 500);
+        assert_eq!(retry_delay_ms(2), 1000);
+        assert_eq!(retry_delay_ms(10), 8000);
     }
 }

@@ -4,6 +4,9 @@ use reqwest::Client;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+const CONNECT_TIMEOUT_SECS: u64 = 20;
+const REQUEST_TIMEOUT_SECS: u64 = 180;
+
 /// Turn an HTTP error body into a short, terminal-friendly message.
 /// - JSON `{error: {message}}` → just the message.
 /// - HTML (Cloudflare blocks, error pages) → extracts `<title>` or headline, drops the markup.
@@ -112,10 +115,7 @@ impl LlmClient {
                 }
                 Err(e) => {
                     let s = format!("{:#}", e);
-                    if ["429", "500", "502", "503", "timeout", "connection"]
-                        .iter()
-                        .any(|&x| s.contains(x))
-                    {
+                    if is_retryable_llm_error(&e) {
                         warn!("Retry {}: {}", i, s);
                         last_err = Some(e);
                         continue;
@@ -124,7 +124,16 @@ impl LlmClient {
                 }
             }
         }
-        bail!("Retries exhausted: {:#}", last_err.unwrap())
+        let err = last_err.unwrap();
+        let detail = format!("{:#}", err);
+        if looks_like_connectivity_timeout(&detail) {
+            bail!(
+                "Retries exhausted after repeated connection/setup failures to {}: {}",
+                self.api_url,
+                detail
+            );
+        }
+        bail!("Retries exhausted: {}", detail)
     }
 
     async fn send(&self, req: &ChatRequest) -> Result<ChatResponse> {
@@ -156,8 +165,8 @@ fn build_http_client() -> Client {
         // shows up in reqwest/rustls as unexpected EOF on reuse.
         .pool_max_idle_per_host(0)
         .http1_only()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .user_agent("rubot/0.1");
 
     #[cfg(target_os = "macos")]
@@ -167,4 +176,61 @@ fn build_http_client() -> Client {
     let builder = builder.use_rustls_tls();
 
     builder.build().unwrap_or_else(|_| Client::new())
+}
+
+fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
+    let text = format!("{:#}", err).to_ascii_lowercase();
+    [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "timeout",
+        "timed out",
+        "connection",
+        "connect",
+        "tls handshake eof",
+        "unexpected eof",
+        "connection reset",
+        "connection closed",
+        "temporarily unavailable",
+        "dns error",
+        "name or service not known",
+        "no route to host",
+        "network is unreachable",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn looks_like_connectivity_timeout(detail: &str) -> bool {
+    let text = detail.to_ascii_lowercase();
+    (text.contains("timed out") || text.contains("timeout"))
+        && (text.contains("connect")
+            || text.contains("connection")
+            || text.contains("tls")
+            || text.contains("handshake"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_retryable_llm_error, looks_like_connectivity_timeout};
+
+    #[test]
+    fn timed_out_connect_errors_are_retryable() {
+        let err = anyhow::anyhow!(
+            "API request failed: error sending request: client error (Connect): operation timed out"
+        );
+        assert!(is_retryable_llm_error(&err));
+        assert!(looks_like_connectivity_timeout(&format!("{:#}", err)));
+    }
+
+    #[test]
+    fn non_network_errors_are_not_marked_retryable() {
+        let err = anyhow::anyhow!("API error (400): bad request");
+        assert!(!is_retryable_llm_error(&err));
+        assert!(!looks_like_connectivity_timeout(&format!("{:#}", err)));
+    }
 }

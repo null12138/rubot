@@ -26,6 +26,56 @@ pub struct Agent {
     last_plan: Option<String>,
     subagents: SubagentManager,
     history_summary: Option<String>,
+    is_subagent: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ToolAttempt {
+    name: String,
+    summary: String,
+    success: bool,
+    preview: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutedTool {
+    call: ToolCall,
+    result: ToolResult,
+    attempt: ToolAttempt,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolRoundReport {
+    entries: Vec<ExecutedTool>,
+}
+
+impl ToolRoundReport {
+    fn has_success(&self) -> bool {
+        self.entries.iter().any(|entry| entry.attempt.success)
+    }
+
+    fn repeated_failure_signatures(&self, previous: &Self) -> Vec<String> {
+        let current = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.attempt.success)
+            .map(|entry| entry.attempt.signature())
+            .collect::<std::collections::BTreeSet<_>>();
+        let prior = previous
+            .entries
+            .iter()
+            .filter(|entry| !entry.attempt.success)
+            .map(|entry| entry.attempt.signature())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        current.intersection(&prior).cloned().collect()
+    }
+}
+
+impl ToolAttempt {
+    fn signature(&self) -> String {
+        format!("{} {}", self.name, self.summary)
+    }
 }
 
 impl Agent {
@@ -99,6 +149,7 @@ impl Agent {
             last_plan: None,
             subagents: SubagentManager::new(),
             history_summary: None,
+            is_subagent: false,
         })
     }
 
@@ -112,13 +163,18 @@ impl Agent {
     }
 
     async fn run_loop(&mut self) -> Result<String> {
+        let mut recent_tool_rounds = Vec::<ToolRoundReport>::new();
+        let mut stall_subagent_spawned = false;
         loop {
             self.iteration_count += 1;
             if self.iteration_count > self.max_iterations {
                 warn!("Max iterations hit");
-                return Ok(format!(
-                    "Reached maximum iterations ({}) without converging.",
-                    self.max_iterations
+                return Ok(self.build_nonconverged_response(
+                    &format!(
+                        "Reached maximum iterations ({}) without converging.",
+                        self.max_iterations
+                    ),
+                    &recent_tool_rounds,
                 ));
             }
 
@@ -148,12 +204,31 @@ impl Agent {
 
             let tool_calls = assistant_msg.tool_calls.unwrap_or_default();
             if !tool_calls.is_empty() {
-                let results = self.execute_tools(&tool_calls).await?;
-                for (tc, result) in results {
+                let round = self.execute_tools(&tool_calls).await?;
+                for executed in &round.entries {
                     self.messages.push(Message::tool_result(
-                        &tc.id,
-                        &result.to_string_for_llm_limited(MAX_TOOL_RESULT_CHARS),
+                        &executed.call.id,
+                        &executed
+                            .result
+                            .to_string_for_llm_limited(MAX_TOOL_RESULT_CHARS),
                     ));
+                }
+
+                if let Some(repeated) = repeated_failure_signatures(&recent_tool_rounds, &round) {
+                    let auto_subagent_id = self
+                        .maybe_spawn_stall_diagnostic_subagent(
+                            &repeated,
+                            &mut stall_subagent_spawned,
+                        )
+                        .await;
+                    let prompt =
+                        build_stall_recovery_prompt(&repeated, auto_subagent_id.as_deref());
+                    self.messages.push(Message::user(&prompt));
+                }
+
+                recent_tool_rounds.push(round);
+                if recent_tool_rounds.len() > MAX_TRACKED_TOOL_ROUNDS {
+                    recent_tool_rounds.remove(0);
                 }
                 continue;
             }
@@ -184,11 +259,8 @@ impl Agent {
         }
     }
 
-    async fn execute_tools(
-        &mut self,
-        tool_calls: &[ToolCall],
-    ) -> Result<Vec<(ToolCall, ToolResult)>> {
-        let mut results = Vec::with_capacity(tool_calls.len());
+    async fn execute_tools(&mut self, tool_calls: &[ToolCall]) -> Result<ToolRoundReport> {
+        let mut entries = Vec::with_capacity(tool_calls.len());
         for tc in tool_calls {
             let params: serde_json::Value =
                 serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
@@ -218,9 +290,19 @@ impl Agent {
                 .map(|l| l.trim().chars().take(80).collect())
                 .unwrap_or_default();
             println!("    {}{}{} {}{}{}", color, mark, R, DIM, preview, R);
-            results.push((tc.clone(), result));
+            let success = result.success;
+            entries.push(ExecutedTool {
+                call: tc.clone(),
+                result,
+                attempt: ToolAttempt {
+                    name: tc.function.name.clone(),
+                    summary,
+                    success,
+                    preview,
+                },
+            });
         }
-        Ok(results)
+        Ok(ToolRoundReport { entries })
     }
 
     async fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -262,6 +344,7 @@ impl Agent {
                     .build()?;
                 rt.block_on(async move {
                     let mut agent = Agent::new(config).await?;
+                    agent.is_subagent = true;
                     if let Some(messages) = seed_messages {
                         agent.messages = messages;
                     }
@@ -449,9 +532,12 @@ impl Agent {
         loop {
             cycle += 1;
             if cycle > MAX_PLAN_CYCLES {
-                return Ok(format!(
-                    "Plan mode stopped after {} cycles without reaching `TASK COMPLETE`.",
-                    MAX_PLAN_CYCLES
+                return Ok(self.build_nonconverged_response(
+                    &format!(
+                        "Plan mode stopped after {} cycles without reaching `TASK COMPLETE`.",
+                        MAX_PLAN_CYCLES
+                    ),
+                    &[],
                 ));
             }
 
@@ -663,6 +749,56 @@ impl Agent {
         out
     }
 
+    fn build_nonconverged_response(&self, reason: &str, rounds: &[ToolRoundReport]) -> String {
+        build_nonconverged_response_from_messages(&self.messages, reason, rounds)
+    }
+
+    async fn maybe_spawn_stall_diagnostic_subagent(
+        &self,
+        repeated: &[String],
+        already_spawned: &mut bool,
+    ) -> Option<String> {
+        if *already_spawned || self.is_subagent || repeated.is_empty() {
+            return None;
+        }
+
+        let repeated_text = repeated
+            .iter()
+            .take(4)
+            .map(|item| format!("- {}", truncate(item, 140)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let task = format!(
+            "Diagnose why the main agent is stuck repeating these failing actions:\n{}\n\nReturn a concise diagnosis with concrete next steps. Do not repeat the same failing action unless the parameters materially change. Avoid spawning more subagents.",
+            repeated_text
+        );
+
+        let config = self.config.clone();
+        let seed_messages = Some(self.shareable_messages());
+        let task_for_runner = task.clone();
+        let id = self
+            .subagents
+            .spawn(task.clone(), true, move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async move {
+                    let mut agent = Agent::new(config).await?;
+                    agent.is_subagent = true;
+                    if let Some(messages) = seed_messages {
+                        agent.messages = messages;
+                    }
+                    let result = agent.process(&task_for_runner).await;
+                    agent.shutdown().await;
+                    result
+                })
+            })
+            .await;
+
+        *already_spawned = true;
+        Some(id)
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -694,7 +830,11 @@ impl Agent {
             .messages
             .iter()
             .find(|m| {
-                m.role == Role::User && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+                m.role == Role::User
+                    && m.content.as_deref().is_some_and(|c| {
+                        let trimmed = c.trim();
+                        !trimmed.is_empty() && !is_internal_control_message(trimmed)
+                    })
             })
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
@@ -704,7 +844,10 @@ impl Agent {
             .rev()
             .find(|m| {
                 m.role == Role::Assistant
-                    && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+                    && m.content.as_deref().is_some_and(|c| {
+                        let trimmed = c.trim();
+                        !trimmed.is_empty() && !looks_like_internal_assistant_message(trimmed)
+                    })
             })
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
@@ -723,7 +866,7 @@ impl Agent {
 
         let _ = self
             .memory
-            .add_memory(MemoryLayer::Working, &summary, &body, &[])
+            .add_memory(MemoryLayer::Working, &summary, &body, &["session"])
             .await;
     }
 }
@@ -743,6 +886,8 @@ const MAX_HISTORY_MESSAGES: usize = 28;
 const KEEP_RECENT_MESSAGES: usize = 12;
 const MAX_HISTORY_CHARS: usize = 18_000;
 const MAX_HISTORY_SUMMARY_CHARS: usize = 3_000;
+const MAX_TRACKED_TOOL_ROUNDS: usize = 6;
+const MAX_NONCONVERGED_ITEMS: usize = 6;
 
 fn compact_memory_index(memory_index: &str) -> String {
     if memory_index.chars().count() <= MAX_MEMORY_INDEX_CHARS {
@@ -832,6 +977,147 @@ fn merge_history_summary(existing: Option<String>, new_summary: String) -> Optio
         _ => new_summary,
     };
     Some(truncate(&merged, MAX_HISTORY_SUMMARY_CHARS))
+}
+
+fn repeated_failure_signatures(
+    history: &[ToolRoundReport],
+    current: &ToolRoundReport,
+) -> Option<Vec<String>> {
+    if current.has_success() {
+        return None;
+    }
+
+    let previous = history.last()?;
+    if previous.has_success() {
+        return None;
+    }
+
+    let repeated = current.repeated_failure_signatures(previous);
+    if repeated.is_empty() {
+        return None;
+    }
+
+    Some(repeated)
+}
+
+fn build_stall_recovery_prompt(repeated: &[String], auto_subagent_id: Option<&str>) -> String {
+    let repeated = repeated
+        .into_iter()
+        .take(4)
+        .map(|s| format!("`{}`", truncate(&s, 120)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = format!(
+        "You are repeating failing tool actions with no progress: {}. Do not retry the same action unless the parameters materially change. Prefer a different approach, inspect the blocker first, or use `subagent_spawn` to delegate diagnosis in parallel. If external/network constraints block completion, stop tool use and give the user a concise progress + blocker summary.",
+        repeated
+    );
+    if let Some(id) = auto_subagent_id {
+        out.push_str(&format!(
+            " A diagnostic subagent `{}` was spawned automatically; continue with a different strategy and use `subagent_wait` when its diagnosis would help.",
+            id
+        ));
+    }
+    out
+}
+
+fn build_nonconverged_response_from_messages(
+    messages: &[Message],
+    reason: &str,
+    rounds: &[ToolRoundReport],
+) -> String {
+    let request = messages
+        .iter()
+        .find_map(|message| {
+            (message.role == Role::User)
+                .then(|| message.content.as_deref().unwrap_or("").trim())
+                .filter(|content| !content.is_empty() && !is_internal_control_message(content))
+        })
+        .unwrap_or("Unknown request");
+
+    let mut successes = Vec::<String>::new();
+    let mut failures = Vec::<String>::new();
+    for round in rounds {
+        for entry in &round.entries {
+            let line = format_attempt_summary(&entry.attempt);
+            if entry.attempt.success {
+                push_unique_limited(&mut successes, line, MAX_NONCONVERGED_ITEMS);
+            } else {
+                push_unique_limited(&mut failures, line, MAX_NONCONVERGED_ITEMS);
+            }
+        }
+    }
+
+    let last_assistant = messages.iter().rev().find_map(|message| {
+        (message.role == Role::Assistant && message.tool_calls.is_none())
+            .then(|| message.content.as_deref().unwrap_or("").trim())
+            .filter(|content| !content.is_empty())
+    });
+
+    let mut out = String::new();
+    out.push_str("Task did not complete automatically.\n\n");
+    out.push_str(&format!("Reason: {}\n", reason));
+    out.push_str(&format!("Request: {}\n", truncate(request, 200)));
+
+    if !successes.is_empty() {
+        out.push_str("\nProgress made:\n");
+        for item in successes {
+            out.push_str("- ");
+            out.push_str(&item);
+            out.push('\n');
+        }
+    }
+
+    if !failures.is_empty() {
+        out.push_str("\nCurrent blockers:\n");
+        for item in failures {
+            out.push_str("- ");
+            out.push_str(&item);
+            out.push('\n');
+        }
+    }
+
+    if let Some(text) = last_assistant {
+        out.push_str("\nLatest assistant reasoning:\n");
+        out.push_str(&truncate(text, 280));
+        out.push('\n');
+    }
+
+    out.push_str("\nRecommended next move: change strategy instead of repeating the same failing tool call. If diagnosis can be parallelized, use `subagent_spawn` for a focused blocker-analysis task.\n");
+    out
+}
+
+fn format_attempt_summary(attempt: &ToolAttempt) -> String {
+    let mut line = attempt.signature();
+    if !attempt.preview.trim().is_empty() {
+        line.push_str(" -> ");
+        line.push_str(attempt.preview.trim());
+    }
+    truncate(&line, 180)
+}
+
+fn push_unique_limited(items: &mut Vec<String>, value: String, max_items: usize) {
+    if items.iter().any(|existing| existing == &value) {
+        return;
+    }
+    if items.len() < max_items {
+        items.push(value);
+    }
+}
+
+fn is_internal_control_message(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed == plan_mode_kickoff_prompt()
+        || trimmed.starts_with("Plan cycle ")
+        || trimmed.starts_with("Based on the tool results above")
+        || trimmed.starts_with("Plan mode requires one of two outputs:")
+        || trimmed.starts_with("You are repeating failing tool actions with no progress:")
+}
+
+fn looks_like_internal_assistant_message(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.eq_ignore_ascii_case("TASK COMPLETE")
+        || trimmed.starts_with("Task did not complete automatically.")
 }
 
 fn should_auto_plan_mode(input: &str) -> bool {
@@ -1101,9 +1387,12 @@ fn format_subagent_snapshot(snapshot: &SubagentSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_memory_index, extract_task_complete, should_auto_plan_mode, summarize_messages,
+        build_nonconverged_response_from_messages, build_stall_recovery_prompt,
+        compact_memory_index, extract_task_complete, repeated_failure_signatures,
+        should_auto_plan_mode, summarize_messages, ExecutedTool, ToolAttempt, ToolRoundReport,
     };
-    use crate::llm::types::{Message, Role};
+    use crate::llm::types::{FunctionCall, Message, Role, ToolCall};
+    use crate::tools::registry::ToolResult;
 
     #[test]
     fn complex_requests_enter_auto_plan_mode() {
@@ -1152,5 +1441,98 @@ mod tests {
         assert!(summary.contains("Earlier conversation summary"));
         assert!(summary.contains("First request"));
         assert!(summary.contains("tool result"));
+    }
+
+    #[test]
+    fn repeated_failures_trigger_recovery_prompt() {
+        let previous = ToolRoundReport {
+            entries: vec![failed_tool(
+                "code_exec",
+                "[bash] cd files/ssrn_crawler",
+                "Exit 1",
+            )],
+        };
+        let current = ToolRoundReport {
+            entries: vec![failed_tool(
+                "code_exec",
+                "[bash] cd files/ssrn_crawler",
+                "Exit 1",
+            )],
+        };
+
+        let repeated = repeated_failure_signatures(&[previous], &current).unwrap();
+        let prompt = build_stall_recovery_prompt(&repeated, Some("sub_1"));
+        assert!(prompt.contains("subagent_spawn"));
+        assert!(prompt.contains("repeating failing tool actions"));
+        assert!(prompt.contains("sub_1"));
+    }
+
+    #[test]
+    fn nonconverged_response_summarizes_progress_and_blockers() {
+        let messages = vec![
+            Message::system("base"),
+            Message::user("帮我爬取 SSRN 并全自动完成"),
+            Message::user("You are repeating failing tool actions with no progress: `code_exec`"),
+            Message::new(Role::Assistant, "Still blocked by SSRN HTTP restrictions."),
+        ];
+        let rounds = vec![
+            ToolRoundReport {
+                entries: vec![ok_tool(
+                    "file_ops",
+                    "read ssrn_crawler/crawler.py",
+                    "#!/usr/bin/env python3",
+                )],
+            },
+            ToolRoundReport {
+                entries: vec![failed_tool(
+                    "web_fetch",
+                    "https://papers.ssrn.com/robots.txt",
+                    "403 Forbidden",
+                )],
+            },
+        ];
+
+        let summary = build_nonconverged_response_from_messages(
+            &messages,
+            "Reached maximum iterations (30) without converging.",
+            &rounds,
+        );
+        assert!(summary.contains("Task did not complete automatically."));
+        assert!(summary.contains("帮我爬取 SSRN"));
+        assert!(summary.contains("Progress made:"));
+        assert!(summary.contains("Current blockers:"));
+        assert!(summary.contains("subagent_spawn"));
+    }
+
+    fn failed_tool(name: &str, summary: &str, preview: &str) -> ExecutedTool {
+        tool(name, summary, preview, false)
+    }
+
+    fn ok_tool(name: &str, summary: &str, preview: &str) -> ExecutedTool {
+        tool(name, summary, preview, true)
+    }
+
+    fn tool(name: &str, summary: &str, preview: &str, success: bool) -> ExecutedTool {
+        ExecutedTool {
+            call: ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: "{}".into(),
+                },
+            },
+            result: if success {
+                ToolResult::ok(preview.into())
+            } else {
+                ToolResult::err(preview.into())
+            },
+            attempt: ToolAttempt {
+                name: name.into(),
+                summary: summary.into(),
+                success,
+                preview: preview.into(),
+            },
+        }
     }
 }

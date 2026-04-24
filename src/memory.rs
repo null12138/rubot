@@ -103,19 +103,45 @@ impl MemorySearch {
         content: &str,
         tags: &[&str],
     ) -> Result<String> {
-        let fname = new_filename();
-        let rel = format!("{}/{}", layer.dir(), fname);
-        let path = self.root.join(&rel);
-        let created = Utc::now().to_rfc3339();
-        let fm = Frontmatter {
-            layer: Some(layer),
-            summary: summary.lines().next().unwrap_or("").trim().to_string(),
-            tags: tags.iter().map(|s| s.to_string()).collect(),
-            created: created.clone(),
-            strength: 0,
-            reviews: 0,
-            last_reviewed: created,
-        };
+        let summary = summary.lines().next().unwrap_or("").trim().to_string();
+        let tags: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+        let now = Utc::now().to_rfc3339();
+
+        let (rel, path, fm) =
+            if let Some((path, mut fm)) = self.find_existing_summary_match(layer, &summary)? {
+                fm.layer = Some(layer);
+                fm.summary = summary.clone();
+                fm.tags = tags.clone();
+                fm.last_reviewed = now.clone();
+                fm.reviews = fm.reviews.saturating_add(1);
+                fm.strength = fm.strength.saturating_add(1).min(MAX_STRENGTH);
+                if fm.created.is_empty() {
+                    fm.created = now.clone();
+                }
+                let rel = format!(
+                    "{}/{}",
+                    layer.dir(),
+                    path.file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or_default()
+                );
+                (rel, path, fm)
+            } else {
+                let fname = new_filename();
+                let rel = format!("{}/{}", layer.dir(), fname);
+                let path = self.root.join(&rel);
+                let fm = Frontmatter {
+                    layer: Some(layer),
+                    summary: summary.clone(),
+                    tags: tags.clone(),
+                    created: now.clone(),
+                    strength: 0,
+                    reviews: 0,
+                    last_reviewed: now,
+                };
+                (rel, path, fm)
+            };
+
         write_entry(&path, &fm, content)?;
         self.rebuild_index()?;
         Ok(rel)
@@ -230,19 +256,23 @@ impl MemorySearch {
         if keywords.is_empty() {
             return Ok(vec![]);
         }
-        let mut entries: Vec<IndexEntry> = self
-            .scan_all()?
-            .into_iter()
-            .filter(|(_, _, fm)| {
-                let s = fm.summary.to_lowercase();
-                keywords.iter().any(|kw| {
-                    s.contains(kw) || fm.tags.iter().any(|t| t.to_lowercase().contains(kw))
-                })
-            })
-            .map(|(p, l, fm)| to_index_entry(&p, l, &fm))
-            .collect();
-        sort_entries(&mut entries);
-        Ok(entries)
+        let mut scored: Vec<(i32, IndexEntry)> = Vec::new();
+        for (path, layer, fm) in self.scan_all()? {
+            let raw = fs::read_to_string(&path).unwrap_or_default();
+            let (_, body) = parse_frontmatter(&raw);
+            let score = score_memory_match(&keywords, &fm, &body);
+            if score <= 0 {
+                continue;
+            }
+            scored.push((score, to_index_entry(&path, layer, &fm)));
+        }
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.layer.prio().cmp(&a.1.layer.prio()))
+                .then_with(|| b.1.strength.cmp(&a.1.strength))
+                .then_with(|| b.1.file.cmp(&a.1.file))
+        });
+        Ok(scored.into_iter().map(|(_, entry)| entry).collect())
     }
 
     /// Entries where now - last_reviewed > DUE_HOURS[strength]h, sorted most-overdue first.
@@ -421,6 +451,35 @@ impl MemorySearch {
         }
         Ok(matches.into_iter().next())
     }
+
+    fn find_existing_summary_match(
+        &self,
+        layer: MemoryLayer,
+        summary: &str,
+    ) -> Result<Option<(PathBuf, Frontmatter)>> {
+        let wanted = normalize_summary(summary);
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+        let dir = self.root.join(layer.dir());
+        let Ok(read) = fs::read_dir(&dir) else {
+            return Ok(None);
+        };
+        for ent in read.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let (fm, _) = parse_frontmatter(&raw);
+            if normalize_summary(&fm.summary) == wanted {
+                return Ok(Some((path, fm)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn to_index_entry(path: &Path, layer: MemoryLayer, fm: &Frontmatter) -> IndexEntry {
@@ -439,8 +498,38 @@ fn sort_entries(v: &mut [IndexEntry]) {
         b.layer
             .prio()
             .cmp(&a.layer.prio())
+            .then_with(|| b.strength.cmp(&a.strength))
             .then_with(|| b.file.cmp(&a.file))
     });
+}
+
+fn score_memory_match(keywords: &[String], fm: &Frontmatter, body: &str) -> i32 {
+    let summary = fm.summary.to_lowercase();
+    let tags = fm
+        .tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect::<Vec<_>>();
+    let body = body.to_lowercase();
+    let mut score = 0i32;
+
+    for keyword in keywords {
+        if summary.contains(keyword) {
+            score += 6;
+        }
+        if tags.iter().any(|tag| tag.contains(keyword)) {
+            score += 4;
+        }
+        if body.contains(keyword) {
+            score += 2;
+        }
+    }
+
+    if !keywords.is_empty() && summary.contains(&keywords.join(" ")) {
+        score += 4;
+    }
+
+    score + i32::from(fm.strength.min(MAX_STRENGTH))
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
@@ -518,6 +607,14 @@ fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+fn normalize_summary(summary: &str) -> String {
+    summary
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 fn infer_layer_from_path(p: &Path) -> Option<MemoryLayer> {
     let parent = p.parent()?.file_name()?.to_str()?;
     MemoryLayer::parse(parent)
@@ -534,4 +631,76 @@ fn random_hex8() -> String {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     format!("{:08x}", nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_summary, MemoryLayer, MemorySearch};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_workspace() -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        dir.push(format!(
+            "rubot-memory-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(dir.join("memory/working")).unwrap();
+        std::fs::create_dir_all(dir.join("memory/episodic")).unwrap();
+        std::fs::create_dir_all(dir.join("memory/semantic")).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn add_memory_deduplicates_same_summary_in_layer() {
+        let workspace = temp_workspace();
+        let memory = MemorySearch::new(&workspace);
+        let first = memory
+            .add_memory(MemoryLayer::Working, "Same Task", "first body", &[])
+            .await
+            .unwrap();
+        let second = memory
+            .add_memory(MemoryLayer::Working, "  same   task  ", "second body", &[])
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        let files = std::fs::read_dir(workspace.join("memory/working"))
+            .unwrap()
+            .flatten()
+            .count();
+        assert_eq!(files, 1);
+        let body = memory.get_entry(&first).await.unwrap().unwrap();
+        assert!(body.contains("second body"));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn quick_search_matches_body_content() {
+        let workspace = temp_workspace();
+        let memory = MemorySearch::new(&workspace);
+        memory
+            .add_memory(
+                MemoryLayer::Semantic,
+                "Crawler notes",
+                "The SSRN crawler is blocked by robots and 403 responses.",
+                &["crawler"],
+            )
+            .await
+            .unwrap();
+
+        let hits = memory.quick_search("robots 403").await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].summary.contains("Crawler notes"));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_summary_squashes_whitespace() {
+        assert_eq!(normalize_summary("  Hello   World "), "hello world");
+    }
 }

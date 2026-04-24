@@ -15,6 +15,7 @@ use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::Helper;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -109,24 +110,32 @@ async fn main() -> anyhow::Result<()> {
 
 fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
     use rustyline::{error::ReadlineError, Config as RLConfig, Editor};
-    let mut rl: Editor<RubotHelper, FileHistory> =
-        Editor::with_config(RLConfig::builder().auto_add_history(true).build())?;
-    rl.set_helper(Some(RubotHelper::new()));
-    let _ = rl.load_history(".rubot_history");
     let rt = tokio::runtime::Handle::current();
+    let history_path =
+        rt.block_on(async { repl_history_path(&agent.lock().await.config().workspace_path) });
+    let mut rl: Editor<RubotHelper, FileHistory> =
+        Editor::with_config(RLConfig::builder().auto_add_history(false).build())?;
+    rl.set_helper(Some(RubotHelper::new()));
+    let _ = rl.load_history(&history_path);
 
     let mut loop_mode = false;
     let mut last_input = String::new();
     let mut stop_condition = String::new();
 
     loop {
-        let line = if loop_mode && !last_input.is_empty() {
-            Ok(format!(
-                "Continue. STOP: {}. End with 'TASK COMPLETE'.",
-                stop_condition
-            ))
+        let (line, synthetic_input) = if loop_mode && !last_input.is_empty() {
+            (
+                Ok(format!(
+                    "Continue. STOP: {}. End with 'TASK COMPLETE'.",
+                    stop_condition
+                )),
+                true,
+            )
         } else {
-            rl.readline("\x1b[1;36mrubot\x1b[0m \x1b[2m›\x1b[0m ")
+            (
+                rl.readline("\x1b[1;36mrubot\x1b[0m \x1b[2m›\x1b[0m "),
+                false,
+            )
         };
 
         match line {
@@ -140,6 +149,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                     match parts[0] {
                         "/quit" | "/exit" => {
                             rt.block_on(async { agent.lock().await.shutdown().await });
+                            let _ = rl.save_history(&history_path);
                             println!("bye.");
                             return Ok(());
                         }
@@ -408,6 +418,9 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 } else {
                     input
                 };
+                if !synthetic_input && should_store_repl_history(input) {
+                    let _ = rl.add_history_entry(input);
+                }
                 let result = rt.block_on(async { agent.lock().await.process(actual).await });
 
                 match result {
@@ -430,13 +443,43 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 rt.block_on(async { agent.lock().await.shutdown().await });
+                let _ = rl.save_history(&history_path);
                 println!("bye.");
                 return Ok(());
             }
             Err(e) => {
+                let _ = rl.save_history(&history_path);
                 eprintln!("readline error: {}", e);
                 return Err(e.into());
             }
         }
+    }
+}
+
+fn repl_history_path(workspace: &Path) -> PathBuf {
+    workspace.join(".rubot_repl_history")
+}
+
+fn should_store_repl_history(input: &str) -> bool {
+    let trimmed = input.trim();
+    !trimmed.is_empty() && !trimmed.starts_with('/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{repl_history_path, should_store_repl_history};
+    use std::path::Path;
+
+    #[test]
+    fn repl_history_is_workspace_scoped() {
+        let path = repl_history_path(Path::new("/tmp/rubot-workspace"));
+        assert_eq!(path, Path::new("/tmp/rubot-workspace/.rubot_repl_history"));
+    }
+
+    #[test]
+    fn repl_history_skips_commands() {
+        assert!(should_store_repl_history("帮我分析这个项目"));
+        assert!(!should_store_repl_history("/model"));
+        assert!(!should_store_repl_history("   "));
     }
 }

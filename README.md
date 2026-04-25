@@ -5,7 +5,7 @@ Minimal autonomous AI agent in Rust: LLM + core tools + flat-file memory. A Thin
 ## Features
 
 - **LLM-agnostic** — works with any OpenAI-compatible API (OpenAI, Azure, Ollama, vLLM, LM Studio, etc.)
-- **Built-in tools** — `web_search`, `web_fetch`, `code_exec`, `file_ops`, `latex_pdf`, plus `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_close`
+- **Built-in tools** — `web_search`, `web_fetch`, `playwright`, `code_exec`, `file_ops`, `latex_pdf`, plus `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_close`
 - **MD-backed tools** — drop a `.md` file in `workspace/tools/` to add new tools at runtime
 - **Flat-file memory** — three-layer Ebbinghaus-style memory (working / episodic / semantic)
 - **Child agents** — spawn background subagents for parallel work
@@ -131,9 +131,14 @@ cargo build --release
 
 > On Windows, `lang: "bash"` in `code_exec` runs PowerShell. `lang: "python"` uses `python` (not `python3`).
 
+> `playwright` needs a working Playwright runtime. If browsers are missing on a new machine, run `python3 -m playwright install chromium` once.
+
 ## Configuration
 
-All settings via environment variables (`.env` file in the working directory):
+All settings live in a global environment file, not the launch directory:
+
+- macOS / Linux: `~/.config/rubot/.env`
+- Windows: `%APPDATA%\\rubot\\.env`
 
 | Variable | Default | Description |
 |---|---|---|
@@ -154,6 +159,8 @@ rubot
 /config set api_key sk-...
 /config set model gpt-4o
 ```
+
+Use `/config` inside Rubot to see the exact active global `.env` path.
 
 ### Local models
 
@@ -182,6 +189,8 @@ workspace/
     ├── episodic/   medium-term (days)
     └── semantic/   long-term (permanent)
 ```
+
+If `RUBOT_WORKSPACE` is relative, it is resolved relative to the global config directory. With the default `workspace`, that means the default workspace becomes `~/.config/rubot/workspace` on macOS/Linux.
 
 Set `RUBOT_WORKSPACE` to an absolute path to customize the location.
 

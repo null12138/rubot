@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail};
 use std::path::{Path, PathBuf};
 
 const ENV_FILE_NAME: &str = ".env";
+const APP_NAME: &str = "rubot";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKey {
@@ -106,7 +107,10 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let _ = dotenvy::dotenv();
+        let env_path = ensure_global_env_available()?;
+        if env_path.is_file() {
+            let _ = dotenvy::from_path(&env_path);
+        }
 
         let api_base_url = std::env::var("RUBOT_API_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
@@ -117,7 +121,7 @@ impl Config {
         let workspace_path = std::env::var("RUBOT_WORKSPACE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("workspace"));
-        let workspace_path = absolutize_workspace_path(workspace_path)?;
+        let workspace_path = absolutize_workspace_path(workspace_path, &env_path)?;
         let max_retries = std::env::var("RUBOT_MAX_RETRIES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -185,7 +189,20 @@ impl Config {
 }
 
 pub fn env_file_path() -> anyhow::Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(ENV_FILE_NAME))
+    Ok(config_dir_path()?.join(ENV_FILE_NAME))
+}
+
+pub fn config_dir_path() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(dir).join(APP_NAME);
+        return Ok(path);
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(dir) = std::env::var_os("APPDATA") {
+            return Ok(PathBuf::from(dir).join(APP_NAME));
+        }
+    }
+    Ok(home_dir()?.join(".config").join(APP_NAME))
 }
 
 pub fn save_config_value(key: ConfigKey, raw_value: &str) -> anyhow::Result<PathBuf> {
@@ -193,10 +210,38 @@ pub fn save_config_value(key: ConfigKey, raw_value: &str) -> anyhow::Result<Path
     std::env::set_var(key.env_name(), &value);
 
     let path = env_file_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = upsert_env_value(&existing, key.env_name(), &value);
     std::fs::write(&path, updated)?;
     Ok(path)
+}
+
+fn ensure_global_env_available() -> anyhow::Result<PathBuf> {
+    let global = env_file_path()?;
+    if global.exists() {
+        return Ok(global);
+    }
+
+    if let Some(parent) = global.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let legacy = legacy_local_env_path()?;
+    if legacy != global && legacy.is_file() {
+        let existing = std::fs::read_to_string(&legacy)?;
+        let migrated =
+            migrate_legacy_env_for_global(&existing, legacy.parent().unwrap_or(Path::new(".")));
+        std::fs::write(&global, migrated)?;
+    }
+
+    Ok(global)
+}
+
+fn legacy_local_env_path() -> anyhow::Result<PathBuf> {
+    Ok(std::env::current_dir()?.join(ENV_FILE_NAME))
 }
 
 fn upsert_env_value(existing: &str, env_name: &str, value: &str) -> String {
@@ -224,6 +269,25 @@ fn upsert_env_value(existing: &str, env_name: &str, value: &str) -> String {
     out
 }
 
+fn migrate_legacy_env_for_global(existing: &str, legacy_base: &Path) -> String {
+    let workspace = read_env_assignment(existing, ConfigKey::Workspace.env_name())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let Some(workspace) = workspace else {
+        return existing.to_string();
+    };
+    if workspace.is_absolute() {
+        return existing.to_string();
+    }
+    let absolute = legacy_base.join(workspace);
+    upsert_env_value(
+        existing,
+        ConfigKey::Workspace.env_name(),
+        &absolute.display().to_string(),
+    )
+}
+
 fn matches_env_assignment(line: &str, env_name: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -234,6 +298,18 @@ fn matches_env_assignment(line: &str, env_name: &str) -> bool {
         return false;
     };
     key.trim() == env_name
+}
+
+fn read_env_assignment<'a>(existing: &'a str, env_name: &str) -> Option<&'a str> {
+    existing.lines().find_map(|line| {
+        if !matches_env_assignment(line, env_name) {
+            return None;
+        }
+        let trimmed = line.trim_start();
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let (_, value) = trimmed.split_once('=')?;
+        Some(value.trim())
+    })
 }
 
 fn encode_env_value(value: &str) -> String {
@@ -263,11 +339,22 @@ fn mask_secret(value: &str) -> String {
     format!("{}***{}", &value[..4], &value[value.len() - 4..])
 }
 
-fn absolutize_workspace_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+fn absolutize_workspace_path(path: PathBuf, env_path: &Path) -> anyhow::Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path);
     }
-    Ok(std::env::current_dir()?.join(path))
+    let base = env_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir()?);
+    Ok(base.join(path))
+}
+
+fn home_dir() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("could not determine home directory"))
 }
 
 fn ensure_gitignore(workspace: &Path) -> anyhow::Result<()> {
@@ -288,7 +375,12 @@ fn ensure_gitignore(workspace: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{upsert_env_value, ConfigKey};
+    use super::{
+        absolutize_workspace_path, config_dir_path, migrate_legacy_env_for_global,
+        upsert_env_value, ConfigKey,
+    };
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn upsert_updates_existing_assignment() {
@@ -316,5 +408,36 @@ mod tests {
             ConfigKey::parse("timeout"),
             Some(ConfigKey::CodeExecTimeout)
         );
+    }
+
+    #[test]
+    fn workspace_paths_resolve_relative_to_env_file() {
+        let env_path = Path::new("/tmp/rubot-config/.env");
+        let resolved = absolutize_workspace_path(PathBuf::from("workspace"), env_path).unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/rubot-config/workspace"));
+    }
+
+    #[test]
+    fn config_dir_prefers_xdg_config_home() {
+        let original = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-rubot-test");
+        let path = config_dir_path().unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/xdg-rubot-test/rubot"));
+        restore_env("XDG_CONFIG_HOME", original);
+    }
+
+    #[test]
+    fn migrate_legacy_env_absolutizes_relative_workspace() {
+        let src = "RUBOT_MODEL=test\nRUBOT_WORKSPACE=workspace\n";
+        let out = migrate_legacy_env_for_global(src, Path::new("/tmp/legacy-rubot"));
+        assert!(out.contains("RUBOT_WORKSPACE=/tmp/legacy-rubot/workspace"));
+    }
+
+    fn restore_env(key: &str, value: Option<OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 }

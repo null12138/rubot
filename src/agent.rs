@@ -13,8 +13,8 @@ use crate::planner::{StepStatus, ToolCallChain};
 use crate::subagent::{SubagentManager, SubagentSnapshot};
 use crate::tools::registry::{ToolRegistry, ToolResult};
 use crate::tools::{
-    code_exec::CodeExec, file_ops::FileOps, latex_pdf::LatexPdf, web_fetch::WebFetch,
-    web_search::WebSearch,
+    code_exec::CodeExec, file_ops::FileOps, latex_pdf::LatexPdf, playwright::PlaywrightTool,
+    web_fetch::WebFetch, web_search::WebSearch,
 };
 
 pub struct Agent {
@@ -128,6 +128,12 @@ impl Agent {
         let tools = ToolRegistry::new(Some(md_dir), md_workdir, config.code_exec_timeout_secs);
         tools.register(Box::new(WebSearch)).await;
         tools.register(Box::new(WebFetch)).await;
+        tools
+            .register(Box::new(PlaywrightTool::new(
+                &config.workspace_path,
+                config.code_exec_timeout_secs,
+            )))
+            .await;
         tools
             .register(Box::new(CodeExec::new(
                 config.code_exec_timeout_secs,

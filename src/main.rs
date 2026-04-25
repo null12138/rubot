@@ -174,7 +174,7 @@ REPL commands:
   /loop <task>|<stop>        Auto-loop until stop condition
 
 Config:
-  Reads .env from the current working directory.
+  Reads a global .env from the Rubot config directory.
   Common keys: RUBOT_API_BASE_URL, RUBOT_API_KEY, RUBOT_MODEL,
   RUBOT_FAST_MODEL, RUBOT_WORKSPACE, RUBOT_MAX_RETRIES.
 ",

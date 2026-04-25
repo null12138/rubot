@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "opener/rubot"
+$Repo = "null12138/rubot"
 $AssetName = "rubot-windows-amd64.zip"
 $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
 

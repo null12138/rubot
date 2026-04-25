@@ -17,7 +17,7 @@ Minimal autonomous AI agent in Rust: LLM + core tools + flat-file memory. A Thin
 
 ### Pre-built binaries (recommended)
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/opener/rubot/releases/latest).
+Download the latest release for your platform from [GitHub Releases](https://github.com/null12138/rubot/releases/latest).
 
 | Platform | File |
 |---|---|
@@ -61,13 +61,13 @@ If you already cloned this repo, the installer auto-detects the local source tre
 
 ```bash
 # Install
-curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash
 
 # Update in place
-curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash -s -- update
+curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash -s -- update
 
 # Uninstall
-curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash -s -- uninstall
+curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash -s -- uninstall
 ```
 
 If you want to force a source install from a local checkout:
@@ -80,15 +80,15 @@ If you want to force a source install from a local checkout:
 
 ```powershell
 # Install
-irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
 
 # Update
 $env:RUBOT_INSTALL_ACTION='update'
-irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
 
 # Uninstall
 $env:RUBOT_INSTALL_ACTION='uninstall'
-irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
 
 # Optional cleanup for the current shell
 Remove-Item Env:RUBOT_INSTALL_ACTION -ErrorAction SilentlyContinue
@@ -99,7 +99,7 @@ Remove-Item Env:RUBOT_INSTALL_ACTION -ErrorAction SilentlyContinue
 **Linux / macOS:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | \
   RUBOT_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
@@ -107,14 +107,14 @@ curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | \
 
 ```powershell
 $env:RUBOT_INSTALL_DIR="$HOME\AppData\Local\rubot\bin"
-irm https://raw.githubusercontent.com/opener/rubot/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
 Remove-Item Env:RUBOT_INSTALL_DIR -ErrorAction SilentlyContinue
 ```
 
 ### Build from source
 
 ```bash
-git clone https://github.com/opener/rubot.git
+git clone https://github.com/null12138/rubot.git
 cd rubot
 cargo build --release
 ./target/release/rubot --version

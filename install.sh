@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="opener/rubot"
+REPO="null12138/rubot"
 ACTION="${RUBOT_INSTALL_ACTION:-install}"
 INSTALL_DIR="${RUBOT_INSTALL_DIR:-/usr/local/bin}"
 MODE="${RUBOT_INSTALL_MODE:-auto}"
@@ -25,9 +25,9 @@ Examples:
   ./install.sh update
   ./install.sh uninstall
   ./install.sh install --source
-  curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash -s -- update
-  curl -fsSL https://raw.githubusercontent.com/opener/rubot/main/install.sh | bash -s -- uninstall
+  curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash -s -- update
+  curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash -s -- uninstall
 EOF
 }
 

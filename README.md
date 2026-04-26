@@ -131,7 +131,9 @@ cargo build --release
 
 > On Windows, `lang: "bash"` in `code_exec` runs PowerShell. `lang: "python"` uses `python` (not `python3`).
 
-> `playwright` needs a working Playwright runtime. If browsers are missing on a new machine, run `python3 -m playwright install chromium` once.
+> `browser` controls a headless Chromium via CDP (pure Rust, no Python needed). Chrome or Chromium must be installed on the system. The browser launches lazily on first use and auto-closes after 2 minutes idle.
+
+> For autonomous browsing, prefer an inspect-act loop: start with `browser` `action=inspect`, then use the returned `target_index` entries for follow-up `click` / `fill` / `press` actions, and inspect again after navigation.
 
 ## Configuration
 
@@ -146,6 +148,7 @@ All settings live in a global environment file, not the launch directory:
 | `RUBOT_API_KEY` | `sk-placeholder` | API key |
 | `RUBOT_MODEL` | `gpt-4o` | Heavy model name |
 | `RUBOT_FAST_MODEL` | = `RUBOT_MODEL` | Fast model for follow-up turns |
+| `RUBOT_TAVILY_API_KEY` | empty | Optional Tavily key used by `web_search` before Bing fallback |
 | `RUBOT_WORKSPACE` | `workspace` | Workspace directory (relative or absolute) |
 | `RUBOT_MAX_RETRIES` | `3` | Max retries for LLM calls |
 | `RUBOT_CODE_EXEC_TIMEOUT` | `30` | `code_exec` timeout (seconds) |
@@ -157,6 +160,7 @@ rubot
 # Then inside rubot:
 /config set api_base_url https://api.openai.com/v1
 /config set api_key sk-...
+/config set tavily_api_key tvly-dev-...
 /config set model gpt-4o
 ```
 

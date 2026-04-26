@@ -176,7 +176,8 @@ REPL commands:
 Config:
   Reads a global .env from the Rubot config directory.
   Common keys: RUBOT_API_BASE_URL, RUBOT_API_KEY, RUBOT_MODEL,
-  RUBOT_FAST_MODEL, RUBOT_WORKSPACE, RUBOT_MAX_RETRIES.
+  RUBOT_FAST_MODEL, RUBOT_TAVILY_API_KEY, RUBOT_WORKSPACE,
+  RUBOT_MAX_RETRIES, RUBOT_CODE_EXEC_TIMEOUT.
 ",
         version = env!("CARGO_PKG_VERSION")
     );
@@ -482,7 +483,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                 }
                                 "help" => {
                                     println!(
-                                        "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, workspace, max_retries, code_exec_timeout"
+                                        "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, tavily_api_key, workspace, max_retries, code_exec_timeout"
                                     );
                                 }
                                 _ => {

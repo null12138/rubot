@@ -30,7 +30,10 @@ impl Tool for WebFetch {
             .connect_timeout(Duration::from_secs(5))
             .build()?;
 
-        let res = client.get(&url).send().await?;
+        let res = match client.get(&url).send().await {
+            Ok(res) => res,
+            Err(err) => return Ok(ToolResult::err(summarize_transport_error(&url, &err))),
+        };
         let status = res.status();
         let body = res.text().await?;
         if let Some(error) = summarize_http_error(&url, status, body.clone()) {
@@ -82,9 +85,37 @@ fn summarize_http_error(url: &str, status: StatusCode, body: String) -> Option<S
     })
 }
 
+fn summarize_transport_error(url: &str, err: &reqwest::Error) -> String {
+    let detail = format!("{:#}", err);
+    summarize_transport_error_detail(url, &detail)
+}
+
+fn summarize_transport_error_detail(url: &str, detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+    if [
+        "ssl_error_syscall",
+        "unexpected eof",
+        "eof occurred in violation of protocol",
+        "tls handshake eof",
+        "connection closed",
+        "unexpected eof while reading",
+        "peer closed connection",
+        "connection reset",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return format!(
+            "TLS / connection handshake failed for {}. The remote site closed the connection before completing HTTPS setup. This usually means site-side blocking, WAF / anti-bot protection, or regional network restrictions. Raw error: {}",
+            url, detail
+        );
+    }
+    format!("Request failed for {}: {}", url, detail)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_url, summarize_http_error};
+    use super::{normalize_url, summarize_http_error, summarize_transport_error_detail};
 
     #[test]
     fn normalize_url_defaults_to_https() {
@@ -107,5 +138,15 @@ mod tests {
         assert!(msg.contains("403 Forbidden"));
         assert!(msg.contains("https://example.com/blocked"));
         assert!(msg.contains("access denied"));
+    }
+
+    #[test]
+    fn summarize_transport_error_classifies_tls_shutdowns() {
+        let msg = summarize_transport_error_detail(
+            "https://www.fenbi.com",
+            "client error (Connect): unexpected eof while reading",
+        );
+        assert!(msg.contains("remote site closed the connection"));
+        assert!(msg.contains("https://www.fenbi.com"));
     }
 }

@@ -1,11 +1,13 @@
 use super::registry::{Tool, ToolResult};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Url;
 use scraper::{Html, Selector};
+use serde::Deserialize;
 
 static UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const MAX_CANDIDATES: usize = 20;
+const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 
 pub struct WebSearch;
 
@@ -20,6 +22,22 @@ struct SearchCandidate {
 #[derive(Debug, Clone, Default)]
 struct SearchConstraints {
     required_hosts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilyResponse {
+    #[serde(default)]
+    results: Vec<TavilyResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilyResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    content: String,
 }
 
 /// Unwrap Bing's click-tracking wrapper of the form
@@ -62,7 +80,7 @@ impl Tool for WebSearch {
         "web_search"
     }
     fn description(&self) -> &str {
-        "Search the web via Bing in US English."
+        "Search the web via Tavily when configured, with Bing as fallback."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}, "max": {"type": "integer"}}, "required": ["query"]})
@@ -71,56 +89,46 @@ impl Tool for WebSearch {
     async fn execute(&self, params: serde_json::Value) -> Result<ToolResult> {
         let q = params["query"].as_str().unwrap_or("");
         let max = params["max"].as_u64().unwrap_or(5).min(10) as usize;
+        if let Some(reason) = risky_query_reason(q) {
+            return Ok(ToolResult::err(reason));
+        }
+        let constraints = parse_constraints(q);
+        let mut backend_errors = Vec::new();
 
-        // Force US/English region so Bing doesn't geo-redirect mainland
-        // China IPs to cn.bing.com and return stale Chinese news caches.
-        //   mkt=en-US      — market
-        //   cc=us          — country code
-        //   setlang=en-US  — UI language
-        //   ensearch=1     — disable auto language detection
-        let url = format!(
-            "https://www.bing.com/search?q={}&mkt=en-US&cc=us&setlang=en-US&ensearch=1",
-            urlencoding::encode(q)
-        );
-        let client = reqwest::Client::builder()
-            .user_agent(UA)
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
-        let body = client
-            .get(&url)
-            // Explicit Accept-Language backs up mkt=en-US for edge cases
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .send()
-            .await?
-            .text()
-            .await?;
-
-        let doc = Html::parse_document(&body);
-        let algo = Selector::parse("li.b_algo").unwrap();
-        let h2 = Selector::parse("h2").unwrap();
-        let a_sel = Selector::parse("a").unwrap();
-        let p_lineclamp = Selector::parse("p.b_lineclamp").unwrap();
-        let p_any = Selector::parse("p").unwrap();
-
-        let mut candidates = vec![];
-        for r in doc.select(&algo).take(MAX_CANDIDATES) {
-            if let Some(h) = r.select(&h2).next() {
-                if let Some(a) = h.select(&a_sel).next() {
-                    let title = a.text().collect::<String>();
-                    let href = a.value().attr("href").unwrap_or("");
-                    let link = decode_bing_url(href);
-                    let snippet = r
-                        .select(&p_lineclamp)
-                        .next()
-                        .or_else(|| r.select(&p_any).next())
-                        .map(|e| e.text().collect::<String>())
-                        .unwrap_or_default();
-                    if let Some(candidate) = build_candidate(title, link, snippet) {
-                        candidates.push(candidate);
+        let tavily_api_key = std::env::var("RUBOT_TAVILY_API_KEY").unwrap_or_default();
+        let candidates = if tavily_api_key.trim().is_empty() {
+            match search_bing(q).await {
+                Ok(candidates) => candidates,
+                Err(err) => {
+                    return Ok(ToolResult::err(format!("web_search failed: {err:#}")));
+                }
+            }
+        } else {
+            match search_tavily(q, &constraints, &tavily_api_key).await {
+                Ok(candidates) if !candidates.is_empty() => candidates,
+                Ok(_) => {
+                    backend_errors.push("Tavily returned no results".to_string());
+                    match search_bing(q).await {
+                        Ok(candidates) => candidates,
+                        Err(err) => {
+                            backend_errors.push(format!("Bing fallback failed: {err:#}"));
+                            return Ok(ToolResult::err(backend_errors.join("\n")));
+                        }
+                    }
+                }
+                Err(err) => {
+                    backend_errors.push(format!("Tavily failed: {err:#}"));
+                    match search_bing(q).await {
+                        Ok(candidates) => candidates,
+                        Err(bing_err) => {
+                            backend_errors.push(format!("Bing fallback failed: {bing_err:#}"));
+                            return Ok(ToolResult::err(backend_errors.join("\n")));
+                        }
                     }
                 }
             }
-        }
+        };
+
         let results = rank_candidates(q, candidates, max)
             .into_iter()
             .map(|item| format!("[{}]({})\n{}", item.title, item.link, item.snippet))
@@ -131,6 +139,109 @@ impl Tool for WebSearch {
             results.join("\n\n")
         }))
     }
+}
+
+async fn search_tavily(
+    query: &str,
+    constraints: &SearchConstraints,
+    api_key: &str,
+) -> Result<Vec<SearchCandidate>> {
+    let client = reqwest::Client::builder()
+        .user_agent(UA)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let mut body = serde_json::json!({
+        "api_key": api_key,
+        "query": query,
+        "topic": "general",
+        "search_depth": "basic",
+        "max_results": MAX_CANDIDATES.min(10),
+        "include_answer": false,
+        "include_images": false,
+        "include_raw_content": false,
+    });
+    if !constraints.required_hosts.is_empty() {
+        body["include_domains"] = serde_json::json!(constraints.required_hosts);
+    }
+
+    let response = client
+        .post(TAVILY_ENDPOINT)
+        .json(&body)
+        .send()
+        .await
+        .context("request to Tavily failed")?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("failed to read Tavily body")?;
+    if !status.is_success() {
+        anyhow::bail!("Tavily HTTP {}: {}", status, text);
+    }
+
+    let parsed: TavilyResponse =
+        serde_json::from_str(&text).context("failed to parse Tavily response")?;
+    Ok(parsed
+        .results
+        .into_iter()
+        .filter_map(|result| build_candidate(result.title, result.url, result.content))
+        .collect())
+}
+
+async fn search_bing(query: &str) -> Result<Vec<SearchCandidate>> {
+    // Force US/English region so Bing doesn't geo-redirect mainland
+    // China IPs to cn.bing.com and return stale Chinese news caches.
+    //   mkt=en-US      — market
+    //   cc=us          — country code
+    //   setlang=en-US  — UI language
+    //   ensearch=1     — disable auto language detection
+    let url = format!(
+        "https://www.bing.com/search?q={}&mkt=en-US&cc=us&setlang=en-US&ensearch=1",
+        urlencoding::encode(query)
+    );
+    let client = reqwest::Client::builder()
+        .user_agent(UA)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let body = client
+        .get(&url)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+        .context("request to Bing failed")?
+        .text()
+        .await
+        .context("failed to read Bing body")?;
+
+    let doc = Html::parse_document(&body);
+    let algo = Selector::parse("li.b_algo").unwrap();
+    let h2 = Selector::parse("h2").unwrap();
+    let a_sel = Selector::parse("a").unwrap();
+    let p_lineclamp = Selector::parse("p.b_lineclamp").unwrap();
+    let p_any = Selector::parse("p").unwrap();
+
+    let mut candidates = vec![];
+    for r in doc.select(&algo).take(MAX_CANDIDATES) {
+        if let Some(h) = r.select(&h2).next() {
+            if let Some(a) = h.select(&a_sel).next() {
+                let title = a.text().collect::<String>();
+                let href = a.value().attr("href").unwrap_or("");
+                let link = decode_bing_url(href);
+                let snippet = r
+                    .select(&p_lineclamp)
+                    .next()
+                    .or_else(|| r.select(&p_any).next())
+                    .map(|e| e.text().collect::<String>())
+                    .unwrap_or_default();
+                if let Some(candidate) = build_candidate(title, link, snippet) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 fn build_candidate(title: String, link: String, snippet: String) -> Option<SearchCandidate> {
@@ -287,9 +398,46 @@ fn is_low_quality_host(host: &str) -> bool {
         "xiaohongshu.com",
         "weather.com.cn",
         "btc123.fans",
+        "zcjsj8.com",
+        "pan.baidu.com",
+        "quark.cn",
+        "aliyundrive.com",
+        "doc88.com",
     ]
     .iter()
     .any(|suffix| host == *suffix || host.ends_with(&format!(".{}", suffix)))
+}
+
+fn risky_query_reason(query: &str) -> Option<String> {
+    let lower = query.to_ascii_lowercase();
+    let has_netdisk_marker = [
+        "百度网盘",
+        "夸克网盘",
+        "阿里云盘",
+        "pan.baidu.com",
+        "quark",
+        "aliyundrive",
+        "123pan",
+        "torrent",
+        "magnet",
+        "ed2k",
+    ]
+    .iter()
+    .any(|needle| query.contains(needle) || lower.contains(needle));
+    let has_free_pdf_mirror_pattern = [
+        "free download pdf",
+        "pdf free download",
+        "免费下载 pdf",
+        "pdf 免费下载",
+        "资源下载",
+        "免登录下载",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle) || query.contains(needle));
+
+    (has_netdisk_marker || has_free_pdf_mirror_pattern).then(|| {
+        "Refusing low-quality or pirated-distribution search query. Do not search for 百度网盘 / 夸克网盘 / free-download PDF mirrors. Prefer official or otherwise authorized sources.".into()
+    })
 }
 
 fn tokenize(query: &str) -> Vec<String> {
@@ -434,6 +582,13 @@ mod tests {
         assert!(!tokens.contains(&"or".into()));
         assert!(tokens.contains(&"ssrn".into()));
         assert!(tokens.contains(&"abstract".into()));
+    }
+
+    #[test]
+    fn risky_queries_are_blocked() {
+        let reason = risky_query_reason("教资真题 PDF 百度网盘 夸克网盘 下载").unwrap();
+        assert!(reason.contains("pirated-distribution"));
+        assert!(reason.contains("百度网盘"));
     }
 
     /// Live hit against Bing. Not run by default (slow + network).

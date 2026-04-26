@@ -10,6 +10,7 @@ pub enum ConfigKey {
     ApiKey,
     Model,
     FastModel,
+    TavilyApiKey,
     Workspace,
     MaxRetries,
     CodeExecTimeout,
@@ -23,6 +24,7 @@ impl ConfigKey {
             "api_key" | "key" | "rubot_api_key" => Some(Self::ApiKey),
             "model" | "rubot_model" => Some(Self::Model),
             "fast_model" | "fast" | "rubot_fast_model" => Some(Self::FastModel),
+            "tavily_api_key" | "tavily" | "rubot_tavily_api_key" => Some(Self::TavilyApiKey),
             "workspace" | "workspace_path" | "rubot_workspace" => Some(Self::Workspace),
             "max_retries" | "retries" | "rubot_max_retries" => Some(Self::MaxRetries),
             "code_exec_timeout" | "timeout" | "rubot_code_exec_timeout" => {
@@ -32,12 +34,13 @@ impl ConfigKey {
         }
     }
 
-    pub fn all() -> [Self; 7] {
+    pub fn all() -> [Self; 8] {
         [
             Self::ApiBaseUrl,
             Self::ApiKey,
             Self::Model,
             Self::FastModel,
+            Self::TavilyApiKey,
             Self::Workspace,
             Self::MaxRetries,
             Self::CodeExecTimeout,
@@ -50,6 +53,7 @@ impl ConfigKey {
             Self::ApiKey => "RUBOT_API_KEY",
             Self::Model => "RUBOT_MODEL",
             Self::FastModel => "RUBOT_FAST_MODEL",
+            Self::TavilyApiKey => "RUBOT_TAVILY_API_KEY",
             Self::Workspace => "RUBOT_WORKSPACE",
             Self::MaxRetries => "RUBOT_MAX_RETRIES",
             Self::CodeExecTimeout => "RUBOT_CODE_EXEC_TIMEOUT",
@@ -62,6 +66,7 @@ impl ConfigKey {
             Self::ApiKey => "api_key",
             Self::Model => "model",
             Self::FastModel => "fast_model",
+            Self::TavilyApiKey => "tavily_api_key",
             Self::Workspace => "workspace",
             Self::MaxRetries => "max_retries",
             Self::CodeExecTimeout => "code_exec_timeout",
@@ -100,6 +105,7 @@ pub struct Config {
     pub api_key: String,
     pub model: String,
     pub fast_model: String,
+    pub tavily_api_key: String,
     pub workspace_path: PathBuf,
     pub max_retries: u32,
     pub code_exec_timeout_secs: u64,
@@ -118,6 +124,7 @@ impl Config {
             std::env::var("RUBOT_API_KEY").unwrap_or_else(|_| "sk-placeholder".to_string());
         let model = std::env::var("RUBOT_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
         let fast_model = std::env::var("RUBOT_FAST_MODEL").unwrap_or_else(|_| model.clone());
+        let tavily_api_key = std::env::var("RUBOT_TAVILY_API_KEY").unwrap_or_default();
         let workspace_path = std::env::var("RUBOT_WORKSPACE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("workspace"));
@@ -136,6 +143,7 @@ impl Config {
             api_key,
             model,
             fast_model,
+            tavily_api_key,
             workspace_path,
             max_retries,
             code_exec_timeout_secs,
@@ -161,7 +169,7 @@ impl Config {
             .into_iter()
             .map(|key| {
                 let value = self.value_for_key(key);
-                let display_value = if key == ConfigKey::ApiKey {
+                let display_value = if key == ConfigKey::ApiKey || key == ConfigKey::TavilyApiKey {
                     mask_secret(&value)
                 } else {
                     value.clone()
@@ -181,6 +189,7 @@ impl Config {
             ConfigKey::ApiKey => self.api_key.clone(),
             ConfigKey::Model => self.model.clone(),
             ConfigKey::FastModel => self.fast_model.clone(),
+            ConfigKey::TavilyApiKey => self.tavily_api_key.clone(),
             ConfigKey::Workspace => self.workspace_path.display().to_string(),
             ConfigKey::MaxRetries => self.max_retries.to_string(),
             ConfigKey::CodeExecTimeout => self.code_exec_timeout_secs.to_string(),
@@ -400,6 +409,7 @@ mod tests {
     #[test]
     fn parse_key_accepts_cli_aliases() {
         assert_eq!(ConfigKey::parse("model"), Some(ConfigKey::Model));
+        assert_eq!(ConfigKey::parse("tavily"), Some(ConfigKey::TavilyApiKey));
         assert_eq!(
             ConfigKey::parse("RUBOT_WORKSPACE"),
             Some(ConfigKey::Workspace)

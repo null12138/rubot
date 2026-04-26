@@ -473,16 +473,16 @@ async fn run_action(
                     parts.push(format!("type={}", t));
                 }
                 if let Some(t) = el["text"].as_str() {
-                    parts.push(format!("text={}", &t[..t.len().min(120)]));
+                    parts.push(format!("text={}", truncate_chars(t, 120)));
                 }
                 if let Some(l) = el["label"].as_str() {
-                    parts.push(format!("label={}", &l[..l.len().min(120)]));
+                    parts.push(format!("label={}", truncate_chars(l, 120)));
                 }
                 if let Some(h) = el["href"].as_str() {
-                    parts.push(format!("href={}", &h[..h.len().min(160)]));
+                    parts.push(format!("href={}", truncate_chars(h, 160)));
                 }
                 if let Some(s) = el["selector"].as_str() {
-                    parts.push(format!("selector={}", &s[..s.len().min(200)]));
+                    parts.push(format!("selector={}", truncate_chars(s, 200)));
                 }
                 output.push(format!(" {}", parts.join(" | ")));
             }
@@ -583,6 +583,17 @@ async fn run_inspect(page: &chromiumoxide::Page, max_elements: u64) -> serde_jso
         .ok()
         .and_then(|r| r.into_value().ok())
         .unwrap_or(serde_json::json!({"headings": [], "elements": []}))
+}
+
+fn truncate_chars(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
 }
 
 fn resolve_selector(selector: &str, target_index: Option<u64>) -> String {

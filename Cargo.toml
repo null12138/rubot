@@ -23,3 +23,5 @@ data-encoding = "2.10.0"
 tar = "0.4"
 flate2 = "1"
 zip = { version = "8.5.1", default-features = false, features = ["deflate"] }
+chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
+futures = "0.3"

@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use reqwest::Url;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -13,7 +15,7 @@ use crate::planner::{StepStatus, ToolCallChain};
 use crate::subagent::{SubagentManager, SubagentSnapshot};
 use crate::tools::registry::{ToolRegistry, ToolResult};
 use crate::tools::{
-    code_exec::CodeExec, file_ops::FileOps, latex_pdf::LatexPdf, playwright::PlaywrightTool,
+    code_exec::CodeExec, file_ops::FileOps, latex_pdf::LatexPdf, browser::BrowserTool,
     web_fetch::WebFetch, web_search::WebSearch,
 };
 
@@ -31,6 +33,7 @@ pub struct Agent {
     history_summary: Option<String>,
     is_subagent: bool,
     restored_session_messages: usize,
+    blocked_domains: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,7 @@ struct ExecutedTool {
 #[derive(Debug, Clone, Default)]
 struct ToolRoundReport {
     entries: Vec<ExecutedTool>,
+    newly_blocked_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -129,7 +133,7 @@ impl Agent {
         tools.register(Box::new(WebSearch)).await;
         tools.register(Box::new(WebFetch)).await;
         tools
-            .register(Box::new(PlaywrightTool::new(
+            .register(Box::new(BrowserTool::new(
                 &config.workspace_path,
                 config.code_exec_timeout_secs,
             )))
@@ -171,6 +175,7 @@ impl Agent {
             history_summary: None,
             is_subagent: false,
             restored_session_messages: 0,
+            blocked_domains: BTreeSet::new(),
         };
         agent.restore_session()
     }
@@ -238,6 +243,12 @@ impl Agent {
                             .to_string_for_llm_limited(MAX_TOOL_RESULT_CHARS),
                     ));
                 }
+                if !round.newly_blocked_domains.is_empty() {
+                    self.messages
+                        .push(Message::user(&build_blocked_source_prompt(
+                            &round.newly_blocked_domains,
+                        )));
+                }
 
                 if let Some(repeated) = repeated_failure_signatures(&recent_tool_rounds, &round) {
                     let auto_subagent_id = self
@@ -264,6 +275,15 @@ impl Agent {
                 return self.run_plan_mode(Some(plan)).await;
             }
 
+            if request_needs_artifact_verification(self.current_request.as_deref())
+                && !has_recent_artifact_verification(&recent_tool_rounds)
+            {
+                self.messages.push(Message::user(
+                    "Before answering, verify the exact files that were actually saved on disk. Use `[Generated files]` tool output or run `file_ops list` on the target directory. Do not count attempted downloads as success, and do not present alternative-site files as if they came from the original source unless you say so explicitly.",
+                ));
+                continue;
+            }
+
             if !is_first_round && response_text.trim().len() < 200 {
                 let prompt = "Based on the tool results above, provide a comprehensive answer to the user's original question.";
                 self.messages.push(Message::user(prompt));
@@ -286,6 +306,7 @@ impl Agent {
 
     async fn execute_tools(&mut self, tool_calls: &[ToolCall]) -> Result<ToolRoundReport> {
         let mut entries = Vec::with_capacity(tool_calls.len());
+        let mut newly_blocked_domains = Vec::new();
         for tc in tool_calls {
             let params: serde_json::Value =
                 serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
@@ -294,7 +315,10 @@ impl Agent {
                 "  {}→{} {}{}{} {}{}{}",
                 DIM, R, CYAN, tc.function.name, R, DIM, summary, R
             );
-            let result = match self.execute_tool_call(&tc.function.name, params).await {
+            let result = match self
+                .execute_tool_call(&tc.function.name, params.clone())
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => ToolResult::err(format!("{:#}", e)),
             };
@@ -316,6 +340,15 @@ impl Agent {
                 .unwrap_or_default();
             println!("    {}{}{} {}{}{}", color, mark, R, DIM, preview, R);
             let success = result.success;
+            if let Some(domain) = detect_new_blocked_domain(
+                &self.blocked_domains,
+                &tc.function.name,
+                &params,
+                &result,
+            ) {
+                self.blocked_domains.insert(domain.clone());
+                push_unique_limited(&mut newly_blocked_domains, domain, 8);
+            }
             entries.push(ExecutedTool {
                 call: tc.clone(),
                 result,
@@ -327,7 +360,10 @@ impl Agent {
                 },
             });
         }
-        Ok(ToolRoundReport { entries })
+        Ok(ToolRoundReport {
+            entries,
+            newly_blocked_domains,
+        })
     }
 
     async fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -505,7 +541,7 @@ impl Agent {
                 let env_path = config::save_config_value(key, &value)?;
                 let new_config = Config::load()?;
                 let reset = self.apply_config(new_config).await?;
-                let display = if key == ConfigKey::ApiKey {
+                let display = if key == ConfigKey::ApiKey || key == ConfigKey::TavilyApiKey {
                     "********".to_string()
                 } else {
                     value.trim().to_string()
@@ -524,7 +560,7 @@ impl Agent {
                 Ok(ToolResult::ok(out))
             }
             "help" => Ok(ToolResult::ok(
-                "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, workspace, max_retries, code_exec_timeout".into(),
+                "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, tavily_api_key, workspace, max_retries, code_exec_timeout".into(),
             )),
             _ => Ok(ToolResult::err(
                 "usage: /config [list|get|set|help] ...".into(),
@@ -1151,6 +1187,61 @@ fn build_stall_recovery_prompt(repeated: &[String], auto_subagent_id: Option<&st
     out
 }
 
+fn build_blocked_source_prompt(domains: &[String]) -> String {
+    let listed = domains
+        .iter()
+        .take(6)
+        .map(|domain| format!("`{}`", domain))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "These domains appear blocked or unusable from the current environment: {}. Do not call `web_fetch` or `browser` on them again in this task unless the user explicitly asks for a retry. Prefer official or otherwise authorized alternatives. Do not pivot to 百度网盘, 夸克网盘, or generic free-download PDF mirror sites.",
+        listed
+    )
+}
+
+fn detect_new_blocked_domain(
+    already_blocked: &BTreeSet<String>,
+    tool_name: &str,
+    params: &serde_json::Value,
+    result: &ToolResult,
+) -> Option<String> {
+    if result.success || !matches!(tool_name, "web_fetch" | "browser") {
+        return None;
+    }
+    if !looks_like_blocked_source_error(result.error.as_deref().unwrap_or_default()) {
+        return None;
+    }
+    let raw_url = params["url"].as_str().unwrap_or("").trim();
+    let host = Url::parse(raw_url)
+        .ok()?
+        .host_str()?
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    (!host.is_empty() && !already_blocked.contains(&host)).then_some(host)
+}
+
+fn looks_like_blocked_source_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "anti-bot",
+        "human-verification",
+        "captcha",
+        "just a moment",
+        "请稍候",
+        "waf",
+        "tls / connection handshake failed",
+        "site-side blocking",
+        "browser connection failed before the page loaded",
+        "remote site appears to be closing or rejecting",
+        "connection closed before",
+        "connection closed",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn build_nonconverged_response_from_messages(
     messages: &[Message],
     explicit_request: Option<&str>,
@@ -1219,6 +1310,48 @@ fn build_nonconverged_response_from_messages(
 
     out.push_str("\nRecommended next move: change strategy instead of repeating the same failing tool call. If diagnosis can be parallelized, use `subagent_spawn` for a focused blocker-analysis task.\n");
     out
+}
+
+fn request_needs_artifact_verification(request: Option<&str>) -> bool {
+    let Some(request) = request.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let lower = request.to_ascii_lowercase();
+    [
+        "下载",
+        "保存",
+        "导出",
+        "生成文件",
+        "pdf",
+        "download",
+        "save",
+        "write file",
+        "export",
+        "crawl papers",
+        "download papers",
+    ]
+    .iter()
+    .any(|needle| request.contains(needle) || lower.contains(needle))
+}
+
+fn has_recent_artifact_verification(rounds: &[ToolRoundReport]) -> bool {
+    rounds
+        .iter()
+        .rev()
+        .take(3)
+        .any(round_has_artifact_verification)
+}
+
+fn round_has_artifact_verification(round: &ToolRoundReport) -> bool {
+    round.entries.iter().any(|entry| {
+        if !entry.result.success {
+            return false;
+        }
+        if entry.result.output.contains("[Generated files") {
+            return true;
+        }
+        entry.call.function.name == "file_ops" && entry.attempt.summary.starts_with("list ")
+    })
 }
 
 fn format_attempt_summary(attempt: &ToolAttempt) -> String {
@@ -1521,14 +1654,16 @@ fn format_subagent_snapshot(snapshot: &SubagentSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_nonconverged_response_from_messages, build_stall_recovery_prompt,
-        clear_session_snapshot_file, compact_memory_index, extract_task_complete,
-        repeated_failure_signatures, session_snapshot_path, should_auto_plan_mode,
-        summarize_messages, ExecutedTool, ToolAttempt, ToolRoundReport,
+        build_blocked_source_prompt, build_nonconverged_response_from_messages,
+        build_stall_recovery_prompt, clear_session_snapshot_file, compact_memory_index,
+        detect_new_blocked_domain, extract_task_complete, has_recent_artifact_verification,
+        repeated_failure_signatures, request_needs_artifact_verification, session_snapshot_path,
+        should_auto_plan_mode, summarize_messages, ExecutedTool, ToolAttempt, ToolRoundReport,
     };
     use crate::config::Config;
     use crate::llm::types::{FunctionCall, Message, Role, ToolCall};
     use crate::tools::registry::ToolResult;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1589,6 +1724,7 @@ mod tests {
                 "[bash] cd files/ssrn_crawler",
                 "Exit 1",
             )],
+            newly_blocked_domains: vec![],
         };
         let current = ToolRoundReport {
             entries: vec![failed_tool(
@@ -1596,6 +1732,7 @@ mod tests {
                 "[bash] cd files/ssrn_crawler",
                 "Exit 1",
             )],
+            newly_blocked_domains: vec![],
         };
 
         let repeated = repeated_failure_signatures(&[previous], &current).unwrap();
@@ -1620,6 +1757,7 @@ mod tests {
                     "read ssrn_crawler/crawler.py",
                     "#!/usr/bin/env python3",
                 )],
+                newly_blocked_domains: vec![],
             },
             ToolRoundReport {
                 entries: vec![failed_tool(
@@ -1627,6 +1765,7 @@ mod tests {
                     "https://papers.ssrn.com/robots.txt",
                     "403 Forbidden",
                 )],
+                newly_blocked_domains: vec![],
             },
         ];
 
@@ -1686,6 +1825,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
+    #[test]
+    fn blocked_source_prompt_mentions_no_retry_and_mirror_sites() {
+        let prompt = build_blocked_source_prompt(&["fenbi.com".into(), "aipta.com".into()]);
+        assert!(prompt.contains("fenbi.com"));
+        assert!(prompt.contains("Do not call `web_fetch` or `browser`"));
+        assert!(prompt.contains("百度网盘"));
+    }
+
+    #[test]
+    fn blocked_domain_is_detected_from_fetch_failures() {
+        let blocked = BTreeSet::new();
+        let params = serde_json::json!({"url": "https://www.fenbi.com/fpr/doc-user-v2/dir/21578"});
+        let result = ToolResult::err(
+            "TLS / connection handshake failed for https://www.fenbi.com/. The remote site closed the connection before completing HTTPS setup. This usually means site-side blocking, WAF / anti-bot protection, or regional network restrictions.".into(),
+        );
+        let domain = detect_new_blocked_domain(&blocked, "web_fetch", &params, &result);
+        assert_eq!(domain.as_deref(), Some("fenbi.com"));
+    }
+
+    #[test]
+    fn download_requests_require_artifact_verification() {
+        assert!(request_needs_artifact_verification(Some(
+            "帮我下载几篇 ssrn 论文"
+        )));
+        assert!(request_needs_artifact_verification(Some(
+            "download a few pdf papers"
+        )));
+        assert!(!request_needs_artifact_verification(Some("解释这个函数")));
+    }
+
+    #[test]
+    fn generated_files_or_file_list_count_as_artifact_verification() {
+        let rounds = vec![ToolRoundReport {
+            entries: vec![ExecutedTool {
+                call: ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "code_exec".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                result: ToolResult::ok("done\n\n[Generated files]\n- /tmp/a.pdf (12 KB)\n".into()),
+                attempt: ToolAttempt {
+                    name: "code_exec".into(),
+                    summary: "[python] ...".into(),
+                    success: true,
+                    preview: "done".into(),
+                },
+            }],
+            newly_blocked_domains: vec![],
+        }];
+        assert!(has_recent_artifact_verification(&rounds));
+    }
+
     fn failed_tool(name: &str, summary: &str, preview: &str) -> ExecutedTool {
         tool(name, summary, preview, false)
     }
@@ -1743,6 +1937,7 @@ mod tests {
             api_key: "sk-test".into(),
             model: "gpt-test".into(),
             fast_model: "gpt-test-fast".into(),
+            tavily_api_key: String::new(),
             workspace_path: workspace.clone(),
             max_retries: 0,
             code_exec_timeout_secs: 30,

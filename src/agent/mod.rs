@@ -947,12 +947,18 @@ impl Agent {
             for line in &b.lines {
                 out.push_str(&format!("\n· {}", line));
             }
+            out.push_str(&format!(
+                "\n\n{dim}Token data from chat completion API. Billing from provider API.{reset}",
+                dim = DIM,
+                reset = R,
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n\n{dim}Billing: not available. Set ANTHROPIC_AUTH_TOKEN for GLM, or configure input_price/output_price for estimated cost.{reset}",
+                dim = DIM,
+                reset = R,
+            ));
         }
-        out.push_str(&format!(
-            "\n\n{dim}Token data from chat completion API. Billing from provider API.{reset}",
-            dim = DIM,
-            reset = R,
-        ));
         out
     }
 
@@ -964,14 +970,41 @@ impl Agent {
             .build()
             .ok()?;
 
-        // ── GLM / ZHIPU mode (default) ──
+        // ── GLM mode from env vars (ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN) ──
         let anthropic_base = std::env::var("ANTHROPIC_BASE_URL").ok();
         let anthropic_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
-        if let Some(ref token) = anthropic_token {
-            if let Some(ref base_url) = anthropic_base {
-                if base_url.contains("bigmodel.cn") || base_url.contains("z.ai") {
-                    return self.fetch_glm_billing(&client, base_url, token).await;
+        if let (Some(ref base), Some(ref token)) = (&anthropic_base, &anthropic_token) {
+            if !token.is_empty() && !base.is_empty() {
+                tracing::info!("billing: detected GLM/ZHIPU from ANTHROPIC_BASE_URL");
+                if let Some(info) = self.fetch_glm_billing(&client, base, token).await {
+                    return Some(info);
                 }
+                tracing::warn!("billing: GLM fetch failed via ANTHROPIC_BASE_URL");
+            }
+        }
+        // If only ANTHROPIC_AUTH_TOKEN is set (no base URL), try default GLM endpoints
+        if let Some(ref token) = anthropic_token {
+            if !token.is_empty() && anthropic_base.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
+                for fallback in ["https://api.z.ai/api/anthropic", "https://open.bigmodel.cn/api/anthropic"] {
+                    tracing::info!("billing: trying GLM fallback endpoint {}", fallback);
+                    if let Some(info) = self.fetch_glm_billing(&client, fallback, token).await {
+                        return Some(info);
+                    }
+                }
+            }
+        }
+
+        // ── GLM mode from api_base_url + api_key ──
+        let api_base = self.config.api_base_url.trim_end_matches('/');
+        let api_key = &self.config.api_key;
+        if !api_key.is_empty() && *api_key != "sk-placeholder" {
+            let is_glm = api_base.contains("bigmodel.cn") || api_base.contains("z.ai") || api_base.contains("glm");
+            if is_glm {
+                tracing::info!("billing: detected GLM from api_base_url");
+                if let Some(info) = self.fetch_glm_billing(&client, api_base, api_key).await {
+                    return Some(info);
+                }
+                tracing::warn!("billing: GLM fetch failed via api_key");
             }
         }
 
@@ -996,6 +1029,7 @@ impl Agent {
                             } else {
                                 format!("${:.2}", used)
                             };
+                            tracing::info!("billing: OpenRouter — spent=${:.2} limit=${:.0}", used, limit);
                             return Some(BillingInfo {
                                 short,
                                 lines: vec![
@@ -1010,25 +1044,24 @@ impl Agent {
         }
 
         // ── OpenAI billing endpoints ──
-        let base = self.config.api_base_url.trim_end_matches('/');
-        let key = &self.config.api_key;
-        if !key.is_empty() && *key != "sk-placeholder" {
-            let sub_url = format!("{}/dashboard/billing/subscription", base);
-            if let Ok(r) = client.get(&sub_url).header("Authorization", format!("Bearer {}", key)).send().await {
+        if !api_key.is_empty() && *api_key != "sk-placeholder" {
+            let sub_url = format!("{}/dashboard/billing/subscription", api_base);
+            if let Ok(r) = client.get(&sub_url).header("Authorization", format!("Bearer {}", api_key)).send().await {
                 if r.status().is_success() {
                     if let Ok(body) = r.json::<serde_json::Value>().await {
                         let limit = body["hard_limit_usd"].as_f64().unwrap_or(0.0);
                         let now = chrono::Utc::now();
                         let start = format!("{}-01", now.format("%Y-%m"));
                         let end = now.format("%Y-%m-%d").to_string();
-                        let usage_url = format!("{}/dashboard/billing/usage?start_date={}&end_date={}", base, start, end);
-                        let used = if let Ok(ur) = client.get(&usage_url).header("Authorization", format!("Bearer {}", key)).send().await {
+                        let usage_url = format!("{}/dashboard/billing/usage?start_date={}&end_date={}", api_base, start, end);
+                        let used = if let Ok(ur) = client.get(&usage_url).header("Authorization", format!("Bearer {}", api_key)).send().await {
                             if ur.status().is_success() {
                                 if let Ok(body) = ur.json::<serde_json::Value>().await {
                                     body["total_usage"].as_f64().unwrap_or(0.0) / 100.0
                                 } else { 0.0 }
                             } else { 0.0 }
                         } else { 0.0 };
+                        tracing::info!("billing: OpenAI — spent=${:.2} limit=${:.0}", used, limit);
                         let short = format!("${:.2}/{}", used, Self::format_usd(limit));
                         return Some(BillingInfo {
                             short,
@@ -1042,6 +1075,7 @@ impl Agent {
             }
         }
 
+        tracing::warn!("billing: no provider matched or all requests failed");
         None
     }
 

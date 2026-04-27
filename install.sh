@@ -88,7 +88,7 @@ else
 fi
 
 run_with_privilege() {
-    if "$@"; then
+    if "$@" 2>/dev/null; then
         return 0
     fi
     if command -v sudo >/dev/null 2>&1; then

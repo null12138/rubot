@@ -26,8 +26,14 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+#[derive(Debug, Clone)]
+pub struct BillingInfo {
+    pub used_usd: f64,
+    pub limit_usd: f64,
+}
 
 pub struct Agent {
     pub(crate) config: Config,
@@ -51,6 +57,7 @@ pub struct Agent {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) request_count: u32,
+    pub billing: Option<BillingInfo>,
     pub channel_send_queue: Arc<Mutex<Vec<PathBuf>>>,
 }
 
@@ -139,6 +146,7 @@ impl Agent {
             prompt_tokens: 0,
             completion_tokens: 0,
             request_count: 0,
+            billing: None,
             channel_send_queue: Arc::new(Mutex::new(Vec::new())),
         };
         // Run memory decay on session start so stale entries are cleaned.
@@ -171,6 +179,10 @@ impl Agent {
         } else {
             self.run_loop().await
         };
+        // Refresh billing info in background (don't block response).
+        if self.billing.is_none() && !self.is_subagent {
+            self.billing = self.fetch_billing().await;
+        }
         result
     }
 
@@ -870,21 +882,25 @@ impl Agent {
         }
     }
 
-    /// Compact one-line HUD inspired by Claude Code's status bar.
+    /// Compact one-line HUD with session tokens + account billing from API.
     pub fn usage_summary(&self) -> String {
-        let elapsed = self.session_start.elapsed();
-        let secs = elapsed.as_secs();
+        let secs = self.session_start.elapsed().as_secs();
         let time = if secs >= 3600 {
             format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
         } else {
             format!("{}m", secs / 60)
         };
-        format!(
-            "  {dim}── ↑{} ↓{}  ·  {} req  ·  {} ──{reset}",
-            Self::fmt_tokens(self.prompt_tokens),
-            Self::fmt_tokens(self.completion_tokens),
-            Self::fmt_num(self.request_count),
+        let mut parts: Vec<String> = vec![
+            format!("↑{} ↓{}", Self::fmt_tokens(self.prompt_tokens), Self::fmt_tokens(self.completion_tokens)),
+            format!("{} req", Self::fmt_num(self.request_count)),
             time,
+        ];
+        if let Some(b) = &self.billing {
+            parts.insert(1, format!("${:.2}/{}", b.used_usd, if b.limit_usd > 0.0 { format!("${:.0}", b.limit_usd) } else { "∞".into() }));
+        }
+        format!(
+            "  {dim}── {} ──{reset}",
+            parts.join("  ·  "),
             reset = R,
             dim = DIM,
         )
@@ -900,23 +916,98 @@ impl Agent {
             format!("{}m", secs / 60)
         };
 
-        format!(
+        let mut out = format!(
             "Usage\n─────\n\n\
-             · Session   {time}\n\
-             · Requests  {n}\n\
-             · Prompt    {pt} tokens\n\
-             · Output    {ot} tokens\n\
-             · Total     {total} tokens\n\
-             \n\
-             {dim}Data from chat completion API responses.{reset}",
+             · Session    {time}\n\
+             · Requests   {n}\n\
+             · Prompt     {pt} tokens\n\
+             · Output     {ot} tokens\n\
+             · Total      {total} tokens",
             time = time,
             n = self.request_count,
             pt = Self::fmt_tokens(self.prompt_tokens),
             ot = Self::fmt_tokens(self.completion_tokens),
             total = Self::fmt_tokens(total),
+        );
+        if let Some(b) = &self.billing {
+            out.push_str(&format!(
+                "\n\n· Billing    ${:.2}",
+                b.used_usd,
+            ));
+            if b.limit_usd > 0.0 {
+                out.push_str(&format!(" / ${:.0} limit", b.limit_usd));
+            }
+        }
+        out.push_str(&format!(
+            "\n\n{dim}Token data from chat completion API. Billing from provider API.{reset}",
             dim = DIM,
             reset = R,
-        )
+        ));
+        out
+    }
+
+    /// Fetch account billing info from the provider API (OpenAI / OpenRouter).
+    /// Returns None on failure or unknown provider (logged, not reported to user).
+    async fn fetch_billing(&self) -> Option<BillingInfo> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+
+        // Try OpenRouter via orkey or api_key
+        for key in [&self.config.orkey, &self.config.api_key] {
+            if key.is_empty() || *key == "sk-placeholder" {
+                continue;
+            }
+            let resp = client
+                .get("https://openrouter.ai/api/v1/auth/key")
+                .header("Authorization", format!("Bearer {}", key))
+                .send()
+                .await;
+            if let Ok(r) = resp {
+                if r.status().is_success() {
+                    if let Ok(body) = r.json::<serde_json::Value>().await {
+                        if let Some(data) = body.get("data") {
+                            let used = data["usage"].as_f64().unwrap_or(0.0);
+                            let limit = data["limit"].as_f64().unwrap_or(0.0);
+                            return Some(BillingInfo { used_usd: used, limit_usd: limit });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try OpenAI billing endpoints
+        let base = self.config.api_base_url.trim_end_matches('/');
+        let key = &self.config.api_key;
+        if !key.is_empty() && *key != "sk-placeholder" {
+            // Subscription (for spending limit)
+            let sub_url = format!("{}/dashboard/billing/subscription", base);
+            if let Ok(r) = client.get(&sub_url).header("Authorization", format!("Bearer {}", key)).send().await {
+                if r.status().is_success() {
+                    if let Ok(body) = r.json::<serde_json::Value>().await {
+                        let limit = body["hard_limit_usd"].as_f64().unwrap_or(0.0);
+
+                        // Usage for current month
+                        let now = chrono::Utc::now();
+                        let start = format!("{}-01", now.format("%Y-%m"));
+                        let end = now.format("%Y-%m-%d").to_string();
+                        let usage_url = format!("{}/dashboard/billing/usage?start_date={}&end_date={}", base, start, end);
+                        if let Ok(ur) = client.get(&usage_url).header("Authorization", format!("Bearer {}", key)).send().await {
+                            if ur.status().is_success() {
+                                if let Ok(body) = ur.json::<serde_json::Value>().await {
+                                    let used_cents = body["total_usage"].as_f64().unwrap_or(0.0);
+                                    return Some(BillingInfo { used_usd: used_cents / 100.0, limit_usd: limit });
+                                }
+                            }
+                        }
+                        return Some(BillingInfo { used_usd: 0.0, limit_usd: limit });
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     pub fn last_plan(&self) -> Option<&str> {

@@ -87,15 +87,18 @@ else
     die "Need curl or wget"
 fi
 
-run_with_privilege() {
-    if "$@" 2>/dev/null; then
-        return 0
+ensure_writable() {
+    local target="$1"
+    # If the target already exists, we need write permission on it.
+    if [[ -e "${target}" ]]; then
+        [[ -w "${target}" ]] && return 0
+    # Otherwise check the parent directory.
+    else
+        local parent
+        parent="$(dirname "${target}")"
+        [[ -w "${parent}" ]] && return 0
     fi
-    if command -v sudo >/dev/null 2>&1; then
-        sudo "$@"
-        return 0
-    fi
-    die "Permission denied and sudo is not available"
+    die "No write permission for ${target}\nRe-run the installer with sudo:\n  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo bash"
 }
 
 target_path() {
@@ -127,7 +130,8 @@ remove_target() {
     if [[ -w "${target}" ]]; then
         rm -f "${target}"
     else
-        run_with_privilege rm -f "${target}"
+        ensure_writable "${target}"
+        rm -f "${target}"
     fi
     msg "Removed ${target}"
 }
@@ -193,19 +197,12 @@ else
 fi
 
 msg "$( [[ "${ACTION}" == "update" ]] && printf "Updating" || printf "Installing" ) to $(target_path)"
-if [[ -d "${INSTALL_DIR}" ]]; then
-    :
-elif [[ -w "$(dirname "${INSTALL_DIR}")" ]]; then
-    mkdir -p "${INSTALL_DIR}"
-else
-    run_with_privilege mkdir -p "${INSTALL_DIR}"
-fi
 
-if [[ -w "${INSTALL_DIR}" ]] || [[ ! -e "$(target_path)" && -w "$(dirname "${INSTALL_DIR}")" ]]; then
-    install -m 755 "${BINARY}" "$(target_path)"
-else
-    run_with_privilege install -m 755 "${BINARY}" "$(target_path)"
-fi
+# Ensure we can write to the install location, or fail early with sudo hint.
+ensure_writable "$(target_path)"
+
+[[ -d "${INSTALL_DIR}" ]] || mkdir -p "${INSTALL_DIR}"
+install -m 755 "${BINARY}" "$(target_path)"
 
 if [[ -x "$(target_path)" ]]; then
     version_line="$("$(target_path)" --version 2>/dev/null || true)"

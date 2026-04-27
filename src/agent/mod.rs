@@ -958,7 +958,7 @@ impl Agent {
 
     /// Fetch account billing/quota from the provider API.
     /// Defaults to GLM (智谱/ZHIPU) endpoints, falls back to OpenAI / OpenRouter.
-    async fn fetch_billing(&self) -> Option<BillingInfo> {
+    pub(crate) async fn fetch_billing(&self) -> Option<BillingInfo> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()

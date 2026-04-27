@@ -628,7 +628,12 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                         }
                         "/usage" => {
                             let detail = rt.block_on(async {
-                                agent.lock().await.usage_detail()
+                                let mut agent = agent.lock().await;
+                                if agent.billing.is_none() {
+                                    let billing = agent.fetch_billing().await;
+                                    agent.billing = billing;
+                                }
+                                agent.usage_detail()
                             });
                             println!("\n{}\n", markdown::render(&detail));
                             continue;

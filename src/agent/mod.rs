@@ -31,8 +31,10 @@ use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct BillingInfo {
-    pub used_usd: f64,
-    pub limit_usd: f64,
+    /// Compact display for the one-line HUD, e.g. "$12.34" or "45%"
+    pub short: String,
+    /// Detail lines for /usage, e.g. ["Token usage (5h): 45%", "MCP usage (1m): 12%"]
+    pub lines: Vec<String>,
 }
 
 pub struct Agent {
@@ -882,6 +884,18 @@ impl Agent {
         }
     }
 
+    fn format_usd(amount: f64) -> String {
+        if amount >= 1_000.0 {
+            format!("${:.0}", amount)
+        } else if amount >= 1.0 {
+            format!("${:.2}", amount)
+        } else if amount > 0.0 {
+            format!("${:.4}", amount)
+        } else {
+            "free".into()
+        }
+    }
+
     /// Compact one-line HUD with session tokens + account billing from API.
     pub fn usage_summary(&self) -> String {
         let secs = self.session_start.elapsed().as_secs();
@@ -896,7 +910,7 @@ impl Agent {
             time,
         ];
         if let Some(b) = &self.billing {
-            parts.insert(1, format!("${:.2}/{}", b.used_usd, if b.limit_usd > 0.0 { format!("${:.0}", b.limit_usd) } else { "∞".into() }));
+            parts.insert(1, b.short.clone());
         }
         format!(
             "  {dim}── {} ──{reset}",
@@ -930,12 +944,8 @@ impl Agent {
             total = Self::fmt_tokens(total),
         );
         if let Some(b) = &self.billing {
-            out.push_str(&format!(
-                "\n\n· Billing    ${:.2}",
-                b.used_usd,
-            ));
-            if b.limit_usd > 0.0 {
-                out.push_str(&format!(" / ${:.0} limit", b.limit_usd));
+            for line in &b.lines {
+                out.push_str(&format!("\n· {}", line));
             }
         }
         out.push_str(&format!(
@@ -946,15 +956,26 @@ impl Agent {
         out
     }
 
-    /// Fetch account billing info from the provider API (OpenAI / OpenRouter).
-    /// Returns None on failure or unknown provider (logged, not reported to user).
+    /// Fetch account billing/quota from the provider API.
+    /// Defaults to GLM (智谱/ZHIPU) endpoints, falls back to OpenAI / OpenRouter.
     async fn fetch_billing(&self) -> Option<BillingInfo> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
             .build()
             .ok()?;
 
-        // Try OpenRouter via orkey or api_key
+        // ── GLM / ZHIPU mode (default) ──
+        let anthropic_base = std::env::var("ANTHROPIC_BASE_URL").ok();
+        let anthropic_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        if let Some(ref token) = anthropic_token {
+            if let Some(ref base_url) = anthropic_base {
+                if base_url.contains("bigmodel.cn") || base_url.contains("z.ai") {
+                    return self.fetch_glm_billing(&client, base_url, token).await;
+                }
+            }
+        }
+
+        // ── OpenRouter via orkey or api_key ──
         for key in [&self.config.orkey, &self.config.api_key] {
             if key.is_empty() || *key == "sk-placeholder" {
                 continue;
@@ -970,44 +991,137 @@ impl Agent {
                         if let Some(data) = body.get("data") {
                             let used = data["usage"].as_f64().unwrap_or(0.0);
                             let limit = data["limit"].as_f64().unwrap_or(0.0);
-                            return Some(BillingInfo { used_usd: used, limit_usd: limit });
+                            let short = if limit > 0.0 {
+                                format!("${:.2}/{}", used, Self::format_usd(limit))
+                            } else {
+                                format!("${:.2}", used)
+                            };
+                            return Some(BillingInfo {
+                                short,
+                                lines: vec![
+                                    format!("Spent: ${:.2}", used),
+                                    if limit > 0.0 { format!("Limit: ${:.0}", limit) } else { "Limit: pay-as-you-go".into() },
+                                ],
+                            });
                         }
                     }
                 }
             }
         }
 
-        // Try OpenAI billing endpoints
+        // ── OpenAI billing endpoints ──
         let base = self.config.api_base_url.trim_end_matches('/');
         let key = &self.config.api_key;
         if !key.is_empty() && *key != "sk-placeholder" {
-            // Subscription (for spending limit)
             let sub_url = format!("{}/dashboard/billing/subscription", base);
             if let Ok(r) = client.get(&sub_url).header("Authorization", format!("Bearer {}", key)).send().await {
                 if r.status().is_success() {
                     if let Ok(body) = r.json::<serde_json::Value>().await {
                         let limit = body["hard_limit_usd"].as_f64().unwrap_or(0.0);
-
-                        // Usage for current month
                         let now = chrono::Utc::now();
                         let start = format!("{}-01", now.format("%Y-%m"));
                         let end = now.format("%Y-%m-%d").to_string();
                         let usage_url = format!("{}/dashboard/billing/usage?start_date={}&end_date={}", base, start, end);
-                        if let Ok(ur) = client.get(&usage_url).header("Authorization", format!("Bearer {}", key)).send().await {
+                        let used = if let Ok(ur) = client.get(&usage_url).header("Authorization", format!("Bearer {}", key)).send().await {
                             if ur.status().is_success() {
                                 if let Ok(body) = ur.json::<serde_json::Value>().await {
-                                    let used_cents = body["total_usage"].as_f64().unwrap_or(0.0);
-                                    return Some(BillingInfo { used_usd: used_cents / 100.0, limit_usd: limit });
-                                }
-                            }
-                        }
-                        return Some(BillingInfo { used_usd: 0.0, limit_usd: limit });
+                                    body["total_usage"].as_f64().unwrap_or(0.0) / 100.0
+                                } else { 0.0 }
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        let short = format!("${:.2}/{}", used, Self::format_usd(limit));
+                        return Some(BillingInfo {
+                            short,
+                            lines: vec![
+                                format!("Spent: ${:.2}", used),
+                                format!("Limit: ${:.0}", limit),
+                            ],
+                        });
                     }
                 }
             }
         }
 
         None
+    }
+
+    /// GLM / ZHIPU billing: queries model-usage, tool-usage, and quota endpoints.
+    async fn fetch_glm_billing(&self, client: &reqwest::Client, base_url: &str, token: &str) -> Option<BillingInfo> {
+        // Extract domain: strip trailing path to get the root API domain
+        let domain = if let Some(pos) = base_url.rfind("/api/") {
+            &base_url[..pos]
+        } else {
+            base_url.trim_end_matches('/')
+        };
+
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::hours(24);
+        let fmt = "%Y-%m-%d %H:%M:%S";
+        let start_time = start.format(fmt).to_string();
+        let end_time = now.format(fmt).to_string();
+
+        let model_url = format!("{}/api/monitor/usage/model-usage", domain);
+        let tool_url = format!("{}/api/monitor/usage/tool-usage", domain);
+        let quota_url = format!("{}/api/monitor/usage/quota/limit", domain);
+
+        // Use ANTHROPIC_AUTH_TOKEN as-is (may be Bearer token or raw key)
+        let auth_header = token.to_string();
+
+        // Parallel requests
+        let (model_r, _tool_r, quota_r) = tokio::join!(
+            client.get(&model_url).query(&[("startTime", &start_time), ("endTime", &end_time)]).header("Authorization", &auth_header).send(),
+            client.get(&tool_url).query(&[("startTime", &start_time), ("endTime", &end_time)]).header("Authorization", &auth_header).send(),
+            client.get(&quota_url).header("Authorization", &auth_header).send(),
+        );
+
+        let mut short = String::new();
+        let mut lines: Vec<String> = Vec::new();
+
+        // Parse quota limits (most important — shows token % and MCP usage %)
+        if let Ok(r) = quota_r {
+            if r.status().is_success() {
+                if let Ok(body) = r.json::<serde_json::Value>().await {
+                    let data = body.get("data").or(Some(&body)).cloned().unwrap_or(body);
+                    if let Some(limits) = data.get("limits").and_then(|l| l.as_array()) {
+                        for limit in limits {
+                            let typ = limit["type"].as_str().unwrap_or("");
+                            let pct = limit["percentage"].as_f64().unwrap_or(0.0);
+                            if typ.contains("TOKENS") || typ.contains("Token") {
+                                short = format!("{:.0}%", pct);
+                                lines.push(format!("Token quota (5h): {:.1}%", pct));
+                            } else if typ.contains("TIME") || typ.contains("MCP") {
+                                let used = limit.get("currentUsage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let tot = limit.get("usage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                lines.push(format!("MCP quota (1m): {:.1}%  ({:.0} / {:.0})", pct, used, tot));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Parse model-usage for token detail
+        if let Ok(r) = model_r {
+            if r.status().is_success() {
+                if let Ok(body) = r.json::<serde_json::Value>().await {
+                    let data = body.get("data").or(Some(&body)).cloned().unwrap_or(body);
+                    let pt = data.get("promptTokens").or_else(|| data.get("inputTokens"));
+                    let ct = data.get("completionTokens").or_else(|| data.get("outputTokens"));
+                    if let (Some(p), Some(c)) = (pt.and_then(|v| v.as_u64()), ct.and_then(|v| v.as_u64())) {
+                        lines.push(format!("Model tokens: ↑{} ↓{}", Self::fmt_tokens(p), Self::fmt_tokens(c)));
+                    }
+                }
+            }
+        }
+
+        if short.is_empty() {
+            short = "quota".into();
+        }
+        if lines.is_empty() {
+            lines.push("(no quota data)".into());
+        }
+
+        Some(BillingInfo { short, lines })
     }
 
     pub fn last_plan(&self) -> Option<&str> {

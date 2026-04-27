@@ -14,6 +14,8 @@ pub enum ConfigKey {
     Workspace,
     MaxRetries,
     CodeExecTimeout,
+    WeChatBotToken,
+    WeChatBaseUrl,
 }
 
 impl ConfigKey {
@@ -30,11 +32,15 @@ impl ConfigKey {
             "code_exec_timeout" | "timeout" | "rubot_code_exec_timeout" => {
                 Some(Self::CodeExecTimeout)
             }
+            "wechat_bot_token" | "bot_token" | "rubot_wechat_bot_token" => {
+                Some(Self::WeChatBotToken)
+            }
+            "wechat_base_url" | "rubot_wechat_base_url" => Some(Self::WeChatBaseUrl),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 8] {
+    pub fn all() -> [Self; 10] {
         [
             Self::ApiBaseUrl,
             Self::ApiKey,
@@ -44,6 +50,8 @@ impl ConfigKey {
             Self::Workspace,
             Self::MaxRetries,
             Self::CodeExecTimeout,
+            Self::WeChatBotToken,
+            Self::WeChatBaseUrl,
         ]
     }
 
@@ -57,6 +65,8 @@ impl ConfigKey {
             Self::Workspace => "RUBOT_WORKSPACE",
             Self::MaxRetries => "RUBOT_MAX_RETRIES",
             Self::CodeExecTimeout => "RUBOT_CODE_EXEC_TIMEOUT",
+            Self::WeChatBotToken => "RUBOT_WECHAT_BOT_TOKEN",
+            Self::WeChatBaseUrl => "RUBOT_WECHAT_BASE_URL",
         }
     }
 
@@ -70,6 +80,8 @@ impl ConfigKey {
             Self::Workspace => "workspace",
             Self::MaxRetries => "max_retries",
             Self::CodeExecTimeout => "code_exec_timeout",
+            Self::WeChatBotToken => "wechat_bot_token",
+            Self::WeChatBaseUrl => "wechat_base_url",
         }
     }
 
@@ -107,8 +119,11 @@ pub struct Config {
     pub fast_model: String,
     pub tavily_api_key: String,
     pub workspace_path: PathBuf,
+    pub cwd: PathBuf,
     pub max_retries: u32,
     pub code_exec_timeout_secs: u64,
+    pub wechat_bot_token: String,
+    pub wechat_base_url: String,
 }
 
 impl Config {
@@ -137,6 +152,10 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
+        let wechat_bot_token = std::env::var("RUBOT_WECHAT_BOT_TOKEN").unwrap_or_default();
+        let wechat_base_url = std::env::var("RUBOT_WECHAT_BASE_URL")
+            .unwrap_or_else(|_| "https://ilinkai.weixin.qq.com".to_string());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         Ok(Self {
             api_base_url,
@@ -145,8 +164,11 @@ impl Config {
             fast_model,
             tavily_api_key,
             workspace_path,
+            cwd,
             max_retries,
             code_exec_timeout_secs,
+            wechat_bot_token,
+            wechat_base_url,
         })
     }
 
@@ -193,6 +215,8 @@ impl Config {
             ConfigKey::Workspace => self.workspace_path.display().to_string(),
             ConfigKey::MaxRetries => self.max_retries.to_string(),
             ConfigKey::CodeExecTimeout => self.code_exec_timeout_secs.to_string(),
+            ConfigKey::WeChatBotToken => mask_secret(&self.wechat_bot_token),
+            ConfigKey::WeChatBaseUrl => self.wechat_base_url.clone(),
         }
     }
 }

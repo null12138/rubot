@@ -1,4 +1,5 @@
 mod agent;
+mod channel;
 mod config;
 mod llm;
 mod markdown;
@@ -75,6 +76,7 @@ impl RubotHelper {
         Self {
             commands: [
                 "/quit", "/exit", "/plan", "/memory", "/model", "/config", "/clear", "/loop",
+                "/wechat",
             ]
             .into_iter()
             .map(Into::into)
@@ -85,16 +87,14 @@ impl RubotHelper {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match parse_startup_action(env::args().skip(1))? {
-        StartupAction::Help => {
-            print_help();
-            return Ok(());
-        }
-        StartupAction::Version => {
-            println!("rubot {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
-        StartupAction::Repl => {}
+    let action = parse_startup_action(env::args().skip(1))?;
+    if action == StartupAction::Help {
+        print_help();
+        return Ok(());
+    }
+    if action == StartupAction::Version {
+        println!("rubot {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
 
     tracing_subscriber::fmt()
@@ -105,18 +105,17 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
+    if action == StartupAction::Wechat {
+        return run_wechat().await;
+    }
+
+    // ── REPL mode ──
     let config = Config::load()?;
     config.ensure_workspace_dirs()?;
     let agent = Arc::new(Mutex::new(agent::Agent::new(config).await?));
     let restored_messages = agent.lock().await.restored_session_messages();
 
-    println!(
-        "{}rubot{} {}— /quit to exit · /loop <task>|<stop> to auto-loop{}",
-        markdown::BOLD,
-        markdown::R,
-        markdown::DIM,
-        markdown::R
-    );
+    println!("rubot {} — /quit to exit", env!("CARGO_PKG_VERSION"));
     if restored_messages > 0 {
         println!(
             "{}[restored {} session messages]{}",
@@ -125,8 +124,24 @@ async fn main() -> anyhow::Result<()> {
             markdown::R
         );
     }
-    let a = agent.clone();
-    tokio::task::spawn_blocking(move || run_repl(a)).await??;
+    tokio::task::spawn_blocking(move || run_repl(agent)).await??;
+    Ok(())
+}
+
+async fn run_wechat() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    config.ensure_workspace_dirs()?;
+
+    if config.wechat_bot_token.is_empty() {
+        anyhow::bail!(
+            "RUBOT_WECHAT_BOT_TOKEN is not set. Run `rubot` and use /wechat setup to scan QR code, or set the token in {} manually.",
+            config::env_file_path()?.display()
+        );
+    }
+
+    println!("rubot wechat — starting WeChat bot...");
+    let agent = Arc::new(Mutex::new(agent::Agent::new(config.clone()).await?));
+    channel::start(agent, config).await?;
     Ok(())
 }
 
@@ -135,6 +150,7 @@ enum StartupAction {
     Repl,
     Help,
     Version,
+    Wechat,
 }
 
 fn parse_startup_action(args: impl IntoIterator<Item = String>) -> anyhow::Result<StartupAction> {
@@ -143,6 +159,7 @@ fn parse_startup_action(args: impl IntoIterator<Item = String>) -> anyhow::Resul
         None => Ok(StartupAction::Repl),
         Some("-h" | "--help") => Ok(StartupAction::Help),
         Some("-V" | "--version") => Ok(StartupAction::Version),
+        Some("wechat") => Ok(StartupAction::Wechat),
         Some(other) => {
             anyhow::bail!("unsupported argument: {other}\n\nRun `rubot --help` for usage.")
         }
@@ -155,7 +172,8 @@ fn print_help() {
 rubot {version}
 
 Usage:
-  rubot
+  rubot                 Start interactive REPL
+  rubot wechat          Start WeChat bot (requires RUBOT_WECHAT_BOT_TOKEN)
   rubot --help
   rubot --version
 
@@ -172,12 +190,14 @@ REPL commands:
   /config set <key> <value>  Save config to .env and apply it
   /plan                      Show the last executed plan
   /loop <task>|<stop>        Auto-loop until stop condition
+  /wechat                    Show WeChat setup instructions
 
 Config:
   Reads a global .env from the Rubot config directory.
   Common keys: RUBOT_API_BASE_URL, RUBOT_API_KEY, RUBOT_MODEL,
   RUBOT_FAST_MODEL, RUBOT_TAVILY_API_KEY, RUBOT_WORKSPACE,
   RUBOT_MAX_RETRIES, RUBOT_CODE_EXEC_TIMEOUT.
+  WeChat keys: RUBOT_WECHAT_BOT_TOKEN, RUBOT_WECHAT_BASE_URL.
 ",
         version = env!("CARGO_PKG_VERSION")
     );
@@ -207,10 +227,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 true,
             )
         } else {
-            (
-                rl.readline("\x1b[1;36mrubot\x1b[0m \x1b[2m›\x1b[0m "),
-                false,
-            )
+            (rl.readline("> "), false)
         };
 
         match line {
@@ -360,7 +377,9 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                 match rt.block_on(async {
                                     agent.lock().await.set_model(parts[1]).await
                                 }) {
-                                    Ok(()) => println!("model set to {}", parts[1]),
+                                    Ok(()) => {
+                                        println!("model set to {}", parts[1]);
+                                    }
                                     Err(e) => {
                                         eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e)
                                     }
@@ -492,6 +511,120 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                             }
                             continue;
                         }
+                        "/wechat" => {
+                            let sub = parts.get(1).copied().unwrap_or("help");
+                            match sub {
+                                "setup" => {
+                                    println!();
+                                    println!(
+                                        "┌─ 微信 iLink Bot 配置 ────────────────────────────┐"
+                                    );
+                                    println!(
+                                        "│                                                  │"
+                                    );
+                                    println!(
+                                        "│  即将生成二维码，请用微信扫码登录                │"
+                                    );
+                                    println!(
+                                        "│  首次使用会创建微信机器人                         │"
+                                    );
+                                    println!(
+                                        "│                                                  │"
+                                    );
+                                    println!(
+                                        "│  Ctrl+C 可随时取消                                │"
+                                    );
+                                    println!(
+                                        "│                                                  │"
+                                    );
+                                    println!(
+                                        "└──────────────────────────────────────────────────┘"
+                                    );
+                                    println!();
+
+                                    // Perform QR login
+                                    let login_result = match rt
+                                        .block_on(async { crate::channel::qr_login().await })
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            eprintln!("✗ Login failed: {:#}", e);
+                                            continue;
+                                        }
+                                    };
+
+                                    // Save to .env
+                                    if let Err(e) = config::save_config_value(
+                                        config::ConfigKey::WeChatBotToken,
+                                        &login_result.bot_token,
+                                    ) {
+                                        eprintln!("failed to save bot_token: {:#}", e);
+                                        continue;
+                                    }
+                                    if let Err(e) = config::save_config_value(
+                                        config::ConfigKey::WeChatBaseUrl,
+                                        &login_result.base_url,
+                                    ) {
+                                        eprintln!("failed to save base_url: {:#}", e);
+                                        continue;
+                                    }
+
+                                    // Reload config and start channel immediately
+                                    match Config::load() {
+                                        Ok(new_config) => {
+                                            let _ = rt.block_on(async {
+                                                agent
+                                                    .lock()
+                                                    .await
+                                                    .apply_config(new_config.clone())
+                                                    .await
+                                            });
+                                            let ch_agent = agent.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) =
+                                                    channel::start(ch_agent, new_config).await
+                                                {
+                                                    tracing::error!("wechat bot exited: {:#}", e);
+                                                }
+                                            });
+                                            println!("✓ WeChat Bot configured and started!");
+                                        }
+                                        Err(e) => {
+                                            eprintln!("warning: failed to reload config: {:#}", e);
+                                            println!("Login saved. Restart rubot to start the WeChat channel.");
+                                        }
+                                    }
+                                    println!();
+                                }
+                                "status" => {
+                                    let token = rt.block_on(async {
+                                        agent.lock().await.config().wechat_bot_token.clone()
+                                    });
+                                    let base_url = rt.block_on(async {
+                                        agent.lock().await.config().wechat_base_url.clone()
+                                    });
+                                    if token.is_empty() {
+                                        println!("WeChat Bot: not configured");
+                                        println!("  Run /wechat setup to scan QR code.");
+                                    } else {
+                                        println!("WeChat Bot: configured");
+                                        println!(
+                                            "  Token: {}...{}",
+                                            &token[..8],
+                                            &token[token.len().saturating_sub(4)..]
+                                        );
+                                        println!("  Base: {}", base_url);
+                                        println!("  Status: active (if rubot was started with valid token)");
+                                    }
+                                }
+                                _ => {
+                                    println!("usage:");
+                                    println!("  /wechat setup    Scan QR code to log in");
+                                    println!("  /wechat status   Show current configuration");
+                                }
+                            }
+                            continue;
+                        }
                         _ => {
                             eprintln!("unknown command: {}", parts[0]);
                             continue;
@@ -511,7 +644,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
 
                 match result {
                     Ok(res) => {
-                        println!("\n{}\n", markdown::render(&res));
+                        println!("{}\n", markdown::render(&res));
                         if loop_mode {
                             if res.contains("TASK COMPLETE") || res.contains(&stop_condition) {
                                 loop_mode = false;

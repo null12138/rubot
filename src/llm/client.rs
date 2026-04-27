@@ -175,10 +175,6 @@ fn build_http_client() -> Client {
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .user_agent("rubot/0.1");
 
-    #[cfg(target_os = "macos")]
-    let builder = builder.use_native_tls();
-
-    #[cfg(not(target_os = "macos"))]
     let builder = builder.use_rustls_tls();
 
     builder.build().unwrap_or_else(|_| Client::new())

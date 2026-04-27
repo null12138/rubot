@@ -70,7 +70,12 @@ impl BrowserTool {
                 .map_err(|e| anyhow!("failed to build browser config: {}", e))?,
         )
         .await
-        .map_err(|e| anyhow!("failed to launch browser: {}. Is Chrome/Chromium installed?", e))?;
+        .map_err(|e| {
+            anyhow!(
+                "failed to launch browser: {}. Is Chrome/Chromium installed?",
+                e
+            )
+        })?;
 
         let browser = Arc::new(browser);
         let arc = Arc::clone(&browser);
@@ -221,10 +226,7 @@ async fn run_action(
         let pages = browser.pages().await.map_err(|e| anyhow!("{}", e))?;
         if let Some(existing) = pages.into_iter().next() {
             let current = existing.url().await.ok().flatten().unwrap_or_default();
-            if current.is_empty()
-                || current == "about:blank"
-                || current == "chrome://newtab/"
-            {
+            if current.is_empty() || current == "about:blank" || current == "chrome://newtab/" {
                 existing
                     .goto(url)
                     .await
@@ -253,7 +255,9 @@ async fn run_action(
         _ if url.is_empty() => {
             let current = page.url().await.ok().flatten().unwrap_or_default();
             if current.is_empty() || current == "about:blank" {
-                return Err(anyhow!("missing url: provide `url` for a new browser session"));
+                return Err(anyhow!(
+                    "missing url: provide `url` for a new browser session"
+                ));
             }
         }
         _ => {}
@@ -334,12 +338,7 @@ async fn run_action(
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 
-    let title = page
-        .get_title()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let title = page.get_title().await.ok().flatten().unwrap_or_default();
     let current_url = page.url().await.ok().flatten().unwrap_or_default();
 
     match action {
@@ -358,7 +357,12 @@ async fn run_action(
                 .await
                 .map_err(|e| anyhow!("{}", e))?
                 .unwrap_or_default();
-            return Ok(format!("Title: {}\nURL: {}\n\n{}", title, current_url, text.trim()));
+            return Ok(format!(
+                "Title: {}\nURL: {}\n\n{}",
+                title,
+                current_url,
+                text.trim()
+            ));
         }
         "html" => {
             let html = if !selector.is_empty() {
@@ -372,7 +376,10 @@ async fn run_action(
             } else {
                 page.content().await.map_err(|e| anyhow!("{}", e))?
             };
-            return Ok(format!("Title: {}\nURL: {}\n\n{}", title, current_url, html));
+            return Ok(format!(
+                "Title: {}\nURL: {}\n\n{}",
+                title, current_url, html
+            ));
         }
         "links" => {
             let result = page
@@ -411,10 +418,7 @@ async fn run_action(
                     }
                 })
                 .unwrap_or_default();
-            return Ok(format!(
-                "Title: {}\nURL: {}\n\n{}",
-                title, current_url, val
-            ));
+            return Ok(format!("Title: {}\nURL: {}\n\n{}", title, current_url, val));
         }
         _ => {}
     }
@@ -436,10 +440,7 @@ async fn run_action(
         None
     };
 
-    let mut output = vec![
-        format!("Title: {}", title),
-        format!("URL: {}", current_url),
-    ];
+    let mut output = vec![format!("Title: {}", title), format!("URL: {}", current_url)];
 
     if let Some(label) = action_label {
         output.push(format!("Action: {}", label));

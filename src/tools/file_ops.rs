@@ -7,15 +7,17 @@ use std::path::{Path, PathBuf};
 pub struct FileOps {
     workspace: PathBuf,
     files_dir: PathBuf,
+    cwd: PathBuf,
 }
 impl FileOps {
-    pub fn new(ws: &Path) -> Self {
+    pub fn new(ws: &Path, cwd: &Path) -> Self {
         let workspace = ws.canonicalize().unwrap_or_else(|_| ws.to_path_buf());
         let d = workspace.join("files");
         let _ = std::fs::create_dir_all(&d);
         Self {
             workspace,
             files_dir: d.canonicalize().unwrap_or(d),
+            cwd: cwd.to_path_buf(),
         }
     }
     fn p(&self, s: &str) -> Result<PathBuf> {
@@ -75,10 +77,25 @@ impl Tool for FileOps {
         let act = params["act"].as_str().unwrap_or("");
         let path = self.p(params["path"].as_str().unwrap_or(""))?;
         match act {
-            "read" => tokio::fs::read_to_string(path)
-                .await
-                .map(ToolResult::ok)
-                .or_else(|e| Ok(ToolResult::err(e.to_string()))),
+            "read" => {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(content) => Ok(ToolResult::ok(content)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && path.is_relative() => {
+                        // Try CWD fallback for bare relative paths
+                        let cwd_path = normalize_under(&self.cwd, &path);
+                        Ok(tokio::fs::read_to_string(&cwd_path)
+                            .await
+                            .map(ToolResult::ok)
+                            .unwrap_or_else(|_| {
+                                ToolResult::err(format!(
+                                    "file not found: {} (looked in workspace/files/ and CWD)",
+                                    path.display()
+                                ))
+                            }))
+                    }
+                    Err(e) => Ok(ToolResult::err(e.to_string())),
+                }
+            }
             "write" | "append" => {
                 if let Some(p) = path.parent() {
                     let _ = tokio::fs::create_dir_all(p).await;
@@ -155,7 +172,7 @@ mod tests {
     #[test]
     fn tools_paths_resolve_under_workspace_root() {
         let workspace = temp_workspace();
-        let ops = FileOps::new(&workspace);
+        let ops = FileOps::new(&workspace, &workspace);
         let path = ops.p("tools/example.md").unwrap();
         assert_eq!(path, ops.workspace.join("tools/example.md"));
         let _ = std::fs::remove_dir_all(workspace);
@@ -164,7 +181,7 @@ mod tests {
     #[test]
     fn absolute_paths_are_allowed() {
         let workspace = temp_workspace();
-        let ops = FileOps::new(&workspace);
+        let ops = FileOps::new(&workspace, &workspace);
         let path = ops.p("/tmp/not-in-workspace.txt").unwrap();
         assert_eq!(path, std::path::PathBuf::from("/tmp/not-in-workspace.txt"));
         let _ = std::fs::remove_dir_all(workspace);

@@ -8,6 +8,10 @@ pub fn base_system_prompt() -> String {
 - Parallelism: call ALL independent tools in ONE response to minimize rounds.
 - Minimal: keep responses focused; no redundant tool calls.
 
+## Safety: Confirm Before Destructive Actions
+Before running any command that modifies the filesystem or system state — creating files (write, mkdir), deleting (rm, rmdir), moving/renaming (mv), installing packages (pip, npm, brew, apt, cargo install), or git mutations (commit, push, branch -D) — first describe what you will do and ask the user to confirm. Only proceed after the user approves.
+Read-only commands (ls, cat, grep, find, stat, wc, head, tail, cargo check, cargo test, git status, git log, git diff) do not need confirmation.
+
 ## Your Toolkit
 - `web_search`, `web_fetch`, `code_exec`, `file_ops`, `latex_pdf`.
 - `rubot_command` for executing supported Rubot CLI runtime/config commands from inside the agent.
@@ -104,6 +108,7 @@ Otherwise, just call the tools directly."##
 
 pub fn session_context_prompt(
     workspace_root: &std::path::Path,
+    cwd: &std::path::Path,
     heavy_model: &str,
     fast_model: &str,
 ) -> String {
@@ -114,6 +119,11 @@ pub fn session_context_prompt(
     let workspace_root_display = workspace_root.display().to_string();
     let workspace = workspace_root.join("files").display().to_string();
     let tools_dir = workspace_root.join("tools").display().to_string();
+    let cwd_display = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .display()
+        .to_string();
     let shell = if cfg!(target_os = "windows") {
         "PowerShell"
     } else {
@@ -132,7 +142,7 @@ pub fn session_context_prompt(
 - OS: **{os}**
 - Shell: {shell}
 - Workspace root: `{workspace_root_display}`
-- Default CWD for `code_exec`: `{workspace}`
+- Launch CWD (where `code_exec` runs): `{cwd}`
 - Tools directory: `{tools_dir}`
 - Configured heavy model: `{heavy_model}`
 - Configured fast model: `{fast_model}`
@@ -143,7 +153,7 @@ pub fn session_context_prompt(
         os = os,
         shell = shell,
         workspace_root_display = workspace_root_display,
-        workspace = workspace,
+        cwd = cwd_display,
         tools_dir = tools_dir,
         heavy_model = heavy_model,
         fast_model = fast_model,
@@ -157,6 +167,14 @@ pub fn date_context_prompt() -> String {
         "## Date Context\n- Current local date: {today}\n- For exact current time, run `code_exec` instead of relying on this prompt snapshot.",
         today = today,
     )
+}
+
+pub fn wechat_channel_prompt() -> String {
+    "\
+## WeChat Channel
+You are connected through WeChat. Any files or images you generate with tools will be auto-detected and sent back through WeChat. \
+If the user asks for a file/image, just create it normally — it will be delivered automatically."
+        .into()
 }
 
 pub fn memory_snapshot_prompt(memory_index: &str) -> String {

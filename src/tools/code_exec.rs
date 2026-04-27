@@ -8,14 +8,16 @@ use tokio::process::Command;
 pub struct CodeExec {
     pub timeout: u64,
     pub dir: PathBuf,
+    pub files_dir: PathBuf,
 }
 impl CodeExec {
-    pub fn new(t: u64, ws: &Path) -> Self {
-        let d = ws.join("files");
-        let _ = std::fs::create_dir_all(&d);
+    pub fn new(t: u64, cwd: &Path, ws: &Path) -> Self {
+        let files_dir = ws.join("files");
+        let _ = std::fs::create_dir_all(&files_dir);
         Self {
             timeout: t,
-            dir: d.canonicalize().unwrap_or(d),
+            dir: cwd.to_path_buf(),
+            files_dir: files_dir.canonicalize().unwrap_or(files_dir),
         }
     }
 }
@@ -26,7 +28,7 @@ impl Tool for CodeExec {
         "code_exec"
     }
     fn description(&self) -> &str {
-        "Run bash or python in workspace `files/`. If files are created, reference the returned absolute paths directly and never base64-encode them."
+        "Run bash or python in the directory where rubot was launched. If files are created, reference the returned absolute paths directly and never base64-encode them."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"lang": {"type": "string", "enum": ["bash", "python"]}, "code": {"type": "string"}}, "required": ["lang", "code"]})
@@ -88,7 +90,17 @@ impl Tool for CodeExec {
         // Snapshot files created or modified during this run — surface them so
         // the LLM knows where its artefacts actually live (prevents the
         // "here's a base64 dump" anti-pattern).
-        let generated = scan_new_files(&self.dir, started_at);
+        // Scan both CWD and workspace/files; deduplicate by path.
+        let mut generated = scan_new_files(&self.dir, started_at);
+        if self.dir != self.files_dir {
+            let ws_gen = scan_new_files(&self.files_dir, started_at);
+            for (path, size) in ws_gen {
+                if !generated.iter().any(|(p, _)| p == &path) {
+                    generated.push((path, size));
+                }
+            }
+        }
+        generated.sort_by(|a, b| a.0.cmp(&b.0));
         if !generated.is_empty() {
             res.push_str("\n\n[Generated files — absolute paths are directly accessible to the user. Reference these paths in your reply; use `[FILE: /abs/path]` markers for auto-attachment on Telegram. Never base64-encode.]\n");
             for (path, size) in &generated {

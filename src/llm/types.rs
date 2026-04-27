@@ -64,6 +64,18 @@ pub struct ChatRequest {
 #[derive(Debug, Deserialize)]
 pub struct ChatResponse {
     pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]

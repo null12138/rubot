@@ -1,4 +1,7 @@
-use super::utils::{channel_send_tool_definition, compact_memory_index, subagent_tool_definitions};
+use super::utils::{
+    channel_send_tool_definition, compact_memory_index, memory_tool_definitions,
+    subagent_tool_definitions,
+};
 use super::Agent;
 use crate::config::Config;
 use crate::llm::client::LlmClient;
@@ -46,13 +49,25 @@ impl Agent {
 
     pub(super) async fn build_runtime(
         config: &Config,
-    ) -> Result<(LlmClient, ToolRegistry, MemorySearch, Vec<Message>)> {
+    ) -> Result<(
+        LlmClient,
+        LlmClient,
+        ToolRegistry,
+        MemorySearch,
+        Vec<Message>,
+    )> {
         let llm = LlmClient::new(
             &config.api_base_url,
             &config.api_key,
             &config.model,
             &config.fast_model,
             config.max_retries,
+        );
+        let sleep_llm = LlmClient::new_sleep(
+            &config.orkey,
+            &config.api_base_url,
+            &config.api_key,
+            &config.fast_model,
         );
 
         let md_dir = config.workspace_path.join("tools");
@@ -84,12 +99,13 @@ impl Agent {
         let memory = MemorySearch::new(&config.workspace_path);
         let prompt_messages = Self::build_prompt_messages(&memory, config).await?;
 
-        Ok((llm, tools, memory, prompt_messages))
+        Ok((llm, sleep_llm, tools, memory, prompt_messages))
     }
 
     pub(super) async fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = self.tools.definitions().await;
         defs.extend(subagent_tool_definitions());
+        defs.extend(memory_tool_definitions());
         defs.push(channel_send_tool_definition());
         defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         defs

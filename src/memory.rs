@@ -65,14 +65,14 @@ pub struct DecayReport {
 }
 
 #[derive(Default, Clone)]
-struct Frontmatter {
-    layer: Option<MemoryLayer>,
-    summary: String,
-    tags: Vec<String>,
-    created: String,
-    strength: u8,
-    reviews: u32,
-    last_reviewed: String,
+pub(crate) struct Frontmatter {
+    pub(crate) layer: Option<MemoryLayer>,
+    pub(crate) summary: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) created: String,
+    pub(crate) strength: u8,
+    pub(crate) reviews: u32,
+    pub(crate) last_reviewed: String,
 }
 
 impl Frontmatter {
@@ -293,6 +293,11 @@ impl MemorySearch {
             .collect();
         with_age.sort_by(|a, b| b.0.cmp(&a.0));
         Ok(with_age.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Expose all entries for sleep-mode consolidation.
+    pub fn scan_all_for_consolidation(&self) -> Vec<(PathBuf, MemoryLayer, Frontmatter)> {
+        self.scan_all().unwrap_or_default()
     }
 
     /// Sweep: promote strong entries up a layer; evict Working entries past 2x their window.

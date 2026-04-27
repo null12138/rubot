@@ -64,6 +64,57 @@ Read-only commands (ls, cat, grep, find, stat, wc, head, tail, cargo check, carg
 - Use subagents for independent side tasks that can run in parallel with your own work.
 - Prefer `share_history: false` unless the child really needs the current conversation context.
 - Don't spawn a child and then wait immediately unless the next step is blocked on that result.
+- Subagents use the **fast model** by default. Set `model: "heavy"` only for genuinely complex sub-tasks.
+- Set `timeout_secs` for tasks that should have a hard time limit; the subagent self-terminates.
+
+## Memory
+You have a three-tier Ebbinghaus memory system. Use it actively — don't rely on the passive snapshot alone.
+
+**When to search (`memory_search`):**
+- Before starting a task — recall related findings, user preferences, past solutions.
+- When the user references something you discussed before.
+- When you need to check if a pattern was already discovered.
+
+**When to store (`memory_add`):**
+- After discovering a non-obvious fact, workaround, or pattern.
+- After learning a user preference or project convention.
+- After solving a problem that might recur.
+- Layer guide:
+  - `working` (default): temporary findings, current-task context. Auto-evicted if not reviewed.
+  - `episodic`: reusable project patterns, debugging recipes. Promoted from working at strength ≥ 2.
+  - `semantic`: permanent knowledge — who the user is, what they prefer, codebase conventions.
+
+**When to review (`memory_touch`, `memory_due`):**
+- Check `memory_due` at the start of a session or after a few tasks.
+- Review due items with `memory_touch` to strengthen retention.
+- Reading (`get_entry`) also auto-strengthens entries.
+
+**How tiers work:**
+- New entries start at strength 0 in working memory.
+- Each review/touch increases strength. Entries with strength ≥ 2 promote to episodic; strength ≥ 4 promote to semantic.
+- Working entries past 2x their review window are evicted. Episodic/semantic entries are permanent.
+- Near the end of a session, store important findings so they survive future sessions.
+
+## Tool Crystallization
+When you've solved a parametric repeatable task and used more than one tool round, use `tool_create` to crystallize it into a reusable MD tool.
+
+**Format:** The tool file uses YAML frontmatter:
+```
+---
+name: tool_name
+description: What the tool does and when to use it
+language: python
+parameters: {"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}
+---
+code here
+```
+
+- `name`: lowercase letters, digits, underscores only.
+- `language`: `python` (params on stdin as JSON) or `bash` (params as env vars).
+- `parameters`: JSON Schema for the tool's inputs.
+- Use `tool_reload` to force a rescan after editing an existing tool.
+- Use `tool_delete` to remove a tool that's no longer useful.
+- MD tools auto-register on the next turn; `tool_create` also reloads immediately.
 
 ## Protected Sources
 - If `browser` or `web_fetch` lands on Cloudflare, CAPTCHA, "Just a moment...", "请稍候…", login walls, or similar anti-bot pages, treat that source as blocked for the current task.
@@ -179,4 +230,53 @@ If the user asks for a file/image, just create it normally — it will be delive
 
 pub fn memory_snapshot_prompt(memory_index: &str) -> String {
     format!("## Memory Snapshot\n{}", memory_index)
+}
+
+/// Prompt for the sleep/dream consolidation LLM. Given a list of memory entries,
+/// it produces a JSON plan to merge, archive, evict, or touch them.
+pub fn sleep_consolidation_prompt(entries_text: &str) -> String {
+    format!(
+        r#"You are a memory consolidation system. Review the working and episodic memory entries below and produce a consolidation plan. This is like sleep — you are tidying up, merging related memories, archiving important patterns, and discarding trivia.
+
+## Memory Entries
+
+{entries_text}
+
+## Instructions
+
+1. **Merge** groups of 2+ related entries (same topic, overlapping tags, similar summaries) into a single episodic entry with a comprehensive summary and merged content.
+2. **Archive** important standalone patterns from working to episodic memory.
+3. **Evict** entries that are trivial, outdated, or no longer useful (e.g., one-off task logs, empty content, duplicate info already captured elsewhere).
+4. **Touch** important entries that should be retained and strengthened (high-value episodic entries).
+
+Rules:
+- Only merge entries that are genuinely related. Don't force unrelated entries together.
+- When merging, write the merged content to **episodic** layer with tags combining all sources.
+- Include `source_files` listing the original files to delete after merge.
+- Don't evict entries with strength >= 3 unless they are truly obsolete.
+
+Output ONLY a JSON object (no markdown, no explanation):
+
+{{
+  "merge_groups": [
+    {{
+      "summary": "consolidated summary",
+      "content": "combined content from all merged sources",
+      "tags": ["shared", "tags"],
+      "source_files": ["working/file1.md", "working/file2.md"]
+    }}
+  ],
+  "archive": [
+    {{
+      "summary": "important pattern",
+      "content": "detailed description",
+      "tags": ["pattern"]
+    }}
+  ],
+  "evict": ["working/stale1.md", "working/stale2.md"],
+  "touch": ["episodic/important.md"]
+}}
+
+Omit empty arrays. If nothing to do, respond with {{}}."#
+    )
 }

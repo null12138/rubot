@@ -10,9 +10,9 @@ pub(crate) use plan::should_auto_plan_mode;
 pub(crate) use session::clear_session_snapshot_file;
 
 use self::utils::{
-    format_subagent_snapshot, format_subagent_summary, is_internal_control_message,
-    looks_like_internal_assistant_message, push_unique_limited, summarize_params, truncate,
-    MAX_TOOL_RESULT_CHARS, MAX_TRACKED_TOOL_ROUNDS,
+    extract_json_object, format_subagent_snapshot, format_subagent_summary,
+    is_internal_control_message, looks_like_internal_assistant_message, push_unique_limited,
+    summarize_params, truncate, MAX_TOOL_RESULT_CHARS, MAX_TRACKED_TOOL_ROUNDS,
 };
 use crate::config::{self, Config, ConfigKey};
 use crate::llm::client::LlmClient;
@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 pub struct Agent {
     pub(crate) config: Config,
     pub(crate) llm: LlmClient,
+    pub(crate) sleep_llm: LlmClient,
     pub(crate) tools: ToolRegistry,
     pub(crate) memory: MemorySearch,
     pub(crate) messages: Vec<Message>,
@@ -45,6 +46,7 @@ pub struct Agent {
     pub(crate) restored_session_messages: usize,
     pub(crate) blocked_domains: BTreeSet<String>,
     pub(crate) session_start: Instant,
+    pub(crate) last_activity: Instant,
     pub(crate) last_request_start: Option<Instant>,
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
@@ -113,11 +115,12 @@ impl ToolAttempt {
 
 impl Agent {
     pub async fn new(config: Config) -> Result<Self> {
-        let (llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
+        let (llm, sleep_llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
 
         let agent = Self {
             config,
             llm,
+            sleep_llm,
             tools,
             memory,
             messages: prompt_messages,
@@ -131,16 +134,34 @@ impl Agent {
             restored_session_messages: 0,
             blocked_domains: BTreeSet::new(),
             session_start: Instant::now(),
+            last_activity: Instant::now(),
             last_request_start: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             request_count: 0,
             channel_send_queue: Arc::new(Mutex::new(Vec::new())),
         };
+        // Run memory decay on session start so stale entries are cleaned.
+        if let Ok(r) = agent.memory.decay().await {
+            if r.promoted + r.evicted > 0 {
+                tracing::info!(
+                    "memory decay on start: promoted={} evicted={}",
+                    r.promoted,
+                    r.evicted
+                );
+            }
+        }
         agent.restore_session()
     }
 
     pub async fn process(&mut self, input: &str) -> Result<String> {
+        // Sleep consolidation: if idle long enough, let the dream model consolidate memories.
+        let idle_secs = self.last_activity.elapsed().as_secs();
+        if idle_secs >= self.config.sleep_interval_secs && !self.is_subagent {
+            self.sleep_consolidate().await;
+        }
+        self.last_activity = Instant::now();
+
         self.current_request = Some(input.trim().to_string());
         self.last_request_start = Some(Instant::now());
         self.messages.push(Message::user(input));
@@ -231,6 +252,18 @@ impl Agent {
                 recent_tool_rounds.push(round);
                 if recent_tool_rounds.len() > MAX_TRACKED_TOOL_ROUNDS {
                     recent_tool_rounds.remove(0);
+                }
+                // Periodic memory decay every ~10 tool rounds.
+                if self.iteration_count % 10 == 0 {
+                    if let Ok(r) = self.memory.decay().await {
+                        if r.promoted + r.evicted > 0 {
+                            tracing::info!(
+                                "memory decay: promoted={} evicted={}",
+                                r.promoted,
+                                r.evicted
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -346,6 +379,12 @@ impl Agent {
             "subagent_wait" => self.subagent_wait(params).await,
             "subagent_list" => self.subagent_list().await,
             "subagent_close" => self.subagent_close(params).await,
+            "memory_search" => self.memory_search(params).await,
+            "memory_add" => self.memory_add(params).await,
+            "memory_touch" => self.memory_touch(params).await,
+            "memory_due" => self.memory_due().await,
+            "tool_create" => self.tool_create(params).await,
+            "tool_delete" => self.tool_delete(params).await,
             _ => self.tools.execute(name, params).await,
         }
     }
@@ -356,9 +395,16 @@ impl Agent {
             return Ok(ToolResult::err("missing task".into()));
         }
         let share_history = params["share_history"].as_bool().unwrap_or(false);
-        let config = self.config.clone();
+        let use_heavy = params["model"].as_str().unwrap_or("fast") == "heavy";
+        let timeout_secs = params["timeout_secs"].as_u64();
+        let mut config = self.config.clone();
+        if !use_heavy {
+            // Subagent uses fast model by default for first-turn cost savings.
+            config.model = config.fast_model.clone();
+        }
         let seed_messages = share_history.then(|| self.shareable_messages());
         let task_for_runner = task.clone();
+        let task_display = task.clone();
         let id = self
             .subagents
             .spawn(task.clone(), share_history, move || {
@@ -371,15 +417,43 @@ impl Agent {
                     if let Some(messages) = seed_messages {
                         agent.messages = messages;
                     }
-                    let result = agent.process(&task_for_runner).await;
+                    agent.max_iterations = 12; // Subagents get fewer iterations.
+                    let process_fut = agent.process(&task_for_runner);
+                    let result = if let Some(secs) = timeout_secs {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(secs),
+                            process_fut,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                agent.shutdown().await;
+                                Ok(format!(
+                                    "Subagent timed out after {}s. Last output: {}",
+                                    secs,
+                                    agent
+                                        .messages
+                                        .iter()
+                                        .rev()
+                                        .find(|m| m.role == Role::Assistant)
+                                        .and_then(|m| m.content.clone())
+                                        .unwrap_or_default()
+                                ))
+                            }
+                        }
+                    } else {
+                        process_fut.await
+                    };
                     agent.shutdown().await;
                     result
                 })
             })
             .await;
+        let model_label = if use_heavy { "heavy" } else { "fast" };
         Ok(ToolResult::ok(format!(
-            "Spawned subagent `{}`.\n- task: {}\n- share_history: {}",
-            id, task, share_history
+            "Spawned subagent `{}`.\n- task: {}\n- model: {}\n- share_history: {}",
+            id, task_display, model_label, share_history
         )))
     }
 
@@ -421,6 +495,148 @@ impl Agent {
             Ok(snapshot) => Ok(ToolResult::ok(format_subagent_snapshot(&snapshot))),
             Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
         }
+    }
+
+    async fn memory_search(&self, params: serde_json::Value) -> Result<ToolResult> {
+        let query = params["query"].as_str().unwrap_or("").trim();
+        if query.is_empty() {
+            return Ok(ToolResult::err("missing query".into()));
+        }
+        match self.memory.quick_search(query).await {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    return Ok(ToolResult::ok("No matching memories found.".into()));
+                }
+                let mut out = String::new();
+                for e in &entries {
+                    out.push_str(&format!(
+                        "- `{}` (s{}) [{}]: {}\n",
+                        e.file,
+                        e.strength,
+                        e.tags.join(", "),
+                        e.summary
+                    ));
+                }
+                Ok(ToolResult::ok(out.trim_end().to_string()))
+            }
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn memory_add(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let summary = params["summary"].as_str().unwrap_or("").trim();
+        let content = params["content"].as_str().unwrap_or("").trim();
+        if summary.is_empty() || content.is_empty() {
+            return Ok(ToolResult::err("missing summary or content".into()));
+        }
+        let layer = match params["layer"].as_str().unwrap_or("working") {
+            "semantic" => MemoryLayer::Semantic,
+            "episodic" => MemoryLayer::Episodic,
+            _ => MemoryLayer::Working,
+        };
+        let tags: Vec<&str> = params["tags"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        match self.memory.add_memory(layer, summary, content, &tags).await {
+            Ok(rel) => Ok(ToolResult::ok(format!("Stored at {}", rel))),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn memory_touch(&self, params: serde_json::Value) -> Result<ToolResult> {
+        let file = params["file"].as_str().unwrap_or("").trim();
+        if file.is_empty() {
+            return Ok(ToolResult::err("missing file id".into()));
+        }
+        match self.memory.touch(file).await {
+            Ok(true) => Ok(ToolResult::ok(format!("Touched {}", file))),
+            Ok(false) => Ok(ToolResult::err(format!("not found: {}", file))),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn memory_due(&self) -> Result<ToolResult> {
+        match self.memory.due().await {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    return Ok(ToolResult::ok("No memories due for review.".into()));
+                }
+                let mut out = String::new();
+                for e in &entries {
+                    out.push_str(&format!(
+                        "- `{}` (s{}) [{}]: {}\n",
+                        e.file,
+                        e.strength,
+                        e.tags.join(", "),
+                        e.summary
+                    ));
+                }
+                Ok(ToolResult::ok(out.trim_end().to_string()))
+            }
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn tool_create(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let name = params["name"].as_str().unwrap_or("").trim();
+        let description = params["description"].as_str().unwrap_or("").trim();
+        let language = params["language"].as_str().unwrap_or("bash").trim();
+        let code = params["code"].as_str().unwrap_or("").trim();
+        if name.is_empty() || description.is_empty() || code.is_empty() {
+            return Ok(ToolResult::err("missing name, description, or code".into()));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Ok(ToolResult::err(
+                "name must be lowercase letters, digits, underscores".into(),
+            ));
+        }
+        let params_schema = params
+            .get("parameters")
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| r#"{"type":"object","properties":{},"required":[]}"#.to_string());
+        let lang_label = match language {
+            "python" | "py" | "python3" => "python",
+            _ => "bash",
+        };
+        let md_content = format!(
+            "---\nname: {name}\ndescription: {description}\nlanguage: {lang_label}\nparameters: {params_schema}\n---\n{code}\n",
+        );
+        let tools_dir = self.config.workspace_path.join("tools");
+        let file_path = tools_dir.join(format!("{}.md", name));
+        if let Err(e) = tokio::fs::write(&file_path, &md_content).await {
+            return Ok(ToolResult::err(format!("failed to write tool: {:#}", e)));
+        }
+        match self.tools.reload_md().await {
+            Ok(n) => Ok(ToolResult::ok(format!(
+                "Created tool `{}` ({}) — {} md tools loaded",
+                name, lang_label, n
+            ))),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn tool_delete(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let name = params["name"].as_str().unwrap_or("").trim();
+        if name.is_empty() {
+            return Ok(ToolResult::err("missing name".into()));
+        }
+        let file_path = self
+            .config
+            .workspace_path
+            .join("tools")
+            .join(format!("{}.md", name));
+        if !file_path.is_file() {
+            return Ok(ToolResult::err(format!("tool not found: {}", name)));
+        }
+        if let Err(e) = tokio::fs::remove_file(&file_path).await {
+            return Ok(ToolResult::err(format!("failed to delete: {:#}", e)));
+        }
+        let _ = self.tools.reload_md().await;
+        Ok(ToolResult::ok(format!("Deleted tool `{}`", name)))
     }
 
     async fn channel_send(&self, params: serde_json::Value) -> Result<ToolResult> {
@@ -587,11 +803,12 @@ impl Agent {
 
     pub async fn apply_config(&mut self, config: Config) -> Result<bool> {
         let workspace_changed = self.config.workspace_path != config.workspace_path;
-        let (llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
+        let (llm, sleep_llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
         self.subagents.abort_all().await;
 
         self.config = config;
         self.llm = llm;
+        self.sleep_llm = sleep_llm;
         self.tools = tools;
         self.memory = memory;
         self.last_plan = None;
@@ -723,5 +940,167 @@ impl Agent {
             .memory
             .add_memory(MemoryLayer::Working, &summary, &body, &["session"])
             .await;
+    }
+
+    /// Dream consolidation: review working memories, merge related entries into episodic,
+    /// evict stale trivia, touch due entries. Uses the sleep LLM (free model via OpenRouter
+    /// if `orkey` is set, otherwise the configured fast model).
+    async fn sleep_consolidate(&mut self) {
+        // Collect all working and episodic entries for the dream prompt.
+        let entries: Vec<_> = self
+            .memory
+            .scan_all_for_consolidation()
+            .into_iter()
+            .filter(|(_, layer, _)| matches!(layer, MemoryLayer::Working | MemoryLayer::Episodic))
+            .collect();
+
+        // Need at least 2 entries to bother merging.
+        let working_count = entries
+            .iter()
+            .filter(|(_, l, _)| *l == MemoryLayer::Working)
+            .count();
+        if working_count < 2 {
+            // Just run decay and return.
+            let _ = self.memory.decay().await;
+            return;
+        }
+
+        // Build a compact summary of entries for the dream prompt.
+        let mut entries_text = String::new();
+        for (path, layer, fm) in &entries {
+            let raw = std::fs::read_to_string(path).unwrap_or_default();
+            let body: String = raw
+                .split("\n---\n")
+                .nth(2)
+                .unwrap_or("")
+                .lines()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n");
+            entries_text.push_str(&format!(
+                "- `{}` [{}] (s{}) tags=[{}]: {}\n  preview: {}\n",
+                path.file_name().and_then(|f| f.to_str()).unwrap_or(""),
+                layer.dir(),
+                fm.strength.min(5),
+                fm.tags.join(", "),
+                fm.summary,
+                truncate(&body, 120),
+            ));
+        }
+
+        let prompt = crate::personality::sleep_consolidation_prompt(&entries_text);
+        let msgs = vec![Message::user(&prompt)];
+
+        let model = self.sleep_llm.model.clone();
+        tracing::info!(
+            "dream: consolidating {} memories ({} working) with {}",
+            entries.len(),
+            working_count,
+            model,
+        );
+
+        // Call the sleep LLM.
+        let response = match self.sleep_llm.chat_with_model(&model, &msgs).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("dream LLM call failed: {:#}", e);
+                let _ = self.memory.decay().await;
+                return;
+            }
+        };
+
+        let text = response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .unwrap_or_default();
+
+        // Parse the JSON plan from the response.
+        let plan = match extract_json_object(&text) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("dream response had no JSON plan, skipping consolidation");
+                let _ = self.memory.decay().await;
+                return;
+            }
+        };
+
+        let mut merged = 0usize;
+        let mut evicted = 0usize;
+        let mut touched = 0usize;
+
+        // Execute merge_groups: create episodic entry from merged working entries.
+        if let Some(groups) = plan.get("merge_groups").and_then(|g| g.as_array()) {
+            for group in groups {
+                let summary = group
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("merged memory");
+                let content = group.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let tags: Vec<&str> = group
+                    .get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let tags_refs: Vec<&str> = tags.iter().map(|s| *s).collect();
+
+                if !content.is_empty() {
+                    if let Ok(rel) = self
+                        .memory
+                        .add_memory(MemoryLayer::Episodic, summary, content, &tags_refs)
+                        .await
+                    {
+                        tracing::info!("dream merged → {}", rel);
+                        merged += 1;
+                    }
+                }
+
+                // Delete source files.
+                if let Some(sources) = group.get("source_files").and_then(|s| s.as_array()) {
+                    for src in sources {
+                        if let Some(fname) = src.as_str() {
+                            let _ = self.memory.delete_entry(fname).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Execute evictions.
+        if let Some(evict_list) = plan.get("evict").and_then(|e| e.as_array()) {
+            for item in evict_list {
+                if let Some(fname) = item.as_str() {
+                    if self.memory.delete_entry(fname).await.unwrap_or(false) {
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+
+        // Execute touches.
+        if let Some(touch_list) = plan.get("touch").and_then(|t| t.as_array()) {
+            for item in touch_list {
+                if let Some(fname) = item.as_str() {
+                    if self.memory.touch(fname).await.unwrap_or(false) {
+                        touched += 1;
+                    }
+                }
+            }
+        }
+
+        // Run decay for standard promotion/eviction.
+        if let Ok(r) = self.memory.decay().await {
+            if r.promoted + r.evicted + merged + evicted + touched > 0 {
+                tracing::info!(
+                    "dream: merged={} evicted={} touched={} decay_promoted={} decay_evicted={}",
+                    merged,
+                    evicted,
+                    touched,
+                    r.promoted,
+                    r.evicted
+                );
+            }
+        }
     }
 }

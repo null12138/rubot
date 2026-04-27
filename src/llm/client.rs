@@ -65,8 +65,40 @@ impl LlmClient {
         }
     }
 
+    /// Build a client for sleep/dream consolidation. Uses OpenRouter free models
+    /// when `orkey` is set; otherwise falls back to the configured fast model.
+    pub fn new_sleep(
+        orkey: &str,
+        fast_api_url: &str,
+        fast_api_key: &str,
+        fast_model: &str,
+    ) -> Self {
+        if orkey.is_empty() {
+            Self {
+                api_url: format!("{}/chat/completions", fast_api_url.trim_end_matches('/')),
+                api_key: fast_api_key.into(),
+                model: fast_model.into(),
+                fast_model: fast_model.into(),
+                retries: 2,
+            }
+        } else {
+            Self {
+                api_url: "https://openrouter.ai/api/v1/chat/completions".into(),
+                api_key: orkey.into(),
+                model: "google/gemini-2.0-flash-exp:free".into(),
+                fast_model: "google/gemini-2.0-flash-exp:free".into(),
+                retries: 2,
+            }
+        }
+    }
+
     pub fn update_model(&mut self, model: &str) {
         self.model = model.into();
+    }
+
+    /// Single chat call with a specific model, no tools. Used for sleep consolidation.
+    pub async fn chat_with_model(&self, model: &str, msgs: &[Message]) -> Result<ChatResponse> {
+        self.exec(model, msgs, None, Some(0.3)).await
     }
 
     pub async fn chat(

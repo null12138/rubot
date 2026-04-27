@@ -16,6 +16,8 @@ pub enum ConfigKey {
     CodeExecTimeout,
     WeChatBotToken,
     WeChatBaseUrl,
+    Orkey,
+    SleepInterval,
 }
 
 impl ConfigKey {
@@ -36,11 +38,13 @@ impl ConfigKey {
                 Some(Self::WeChatBotToken)
             }
             "wechat_base_url" | "rubot_wechat_base_url" => Some(Self::WeChatBaseUrl),
+            "orkey" | "rubot_orkey" | "openrouter_key" => Some(Self::Orkey),
+            "sleep_interval" | "rubot_sleep_interval" | "sleep" => Some(Self::SleepInterval),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 10] {
+    pub fn all() -> [Self; 12] {
         [
             Self::ApiBaseUrl,
             Self::ApiKey,
@@ -52,6 +56,8 @@ impl ConfigKey {
             Self::CodeExecTimeout,
             Self::WeChatBotToken,
             Self::WeChatBaseUrl,
+            Self::Orkey,
+            Self::SleepInterval,
         ]
     }
 
@@ -67,6 +73,8 @@ impl ConfigKey {
             Self::CodeExecTimeout => "RUBOT_CODE_EXEC_TIMEOUT",
             Self::WeChatBotToken => "RUBOT_WECHAT_BOT_TOKEN",
             Self::WeChatBaseUrl => "RUBOT_WECHAT_BASE_URL",
+            Self::Orkey => "RUBOT_ORKEY",
+            Self::SleepInterval => "RUBOT_SLEEP_INTERVAL",
         }
     }
 
@@ -82,6 +90,8 @@ impl ConfigKey {
             Self::CodeExecTimeout => "code_exec_timeout",
             Self::WeChatBotToken => "wechat_bot_token",
             Self::WeChatBaseUrl => "wechat_base_url",
+            Self::Orkey => "orkey",
+            Self::SleepInterval => "sleep_interval",
         }
     }
 
@@ -95,10 +105,10 @@ impl ConfigKey {
                 .parse::<u32>()
                 .map(|n| n.to_string())
                 .map_err(|_| anyhow!("max_retries must be a non-negative integer")),
-            Self::CodeExecTimeout => value
+            Self::CodeExecTimeout | Self::SleepInterval => value
                 .parse::<u64>()
                 .map(|n| n.to_string())
-                .map_err(|_| anyhow!("code_exec_timeout must be a non-negative integer")),
+                .map_err(|_| anyhow!("must be a non-negative integer")),
             _ => Ok(value.to_string()),
         }
     }
@@ -124,6 +134,8 @@ pub struct Config {
     pub code_exec_timeout_secs: u64,
     pub wechat_bot_token: String,
     pub wechat_base_url: String,
+    pub orkey: String,
+    pub sleep_interval_secs: u64,
 }
 
 impl Config {
@@ -156,6 +168,11 @@ impl Config {
         let wechat_base_url = std::env::var("RUBOT_WECHAT_BASE_URL")
             .unwrap_or_else(|_| "https://ilinkai.weixin.qq.com".to_string());
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let orkey = std::env::var("RUBOT_ORKEY").unwrap_or_default();
+        let sleep_interval_secs = std::env::var("RUBOT_SLEEP_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
 
         Ok(Self {
             api_base_url,
@@ -169,6 +186,8 @@ impl Config {
             code_exec_timeout_secs,
             wechat_bot_token,
             wechat_base_url,
+            orkey,
+            sleep_interval_secs,
         })
     }
 
@@ -217,6 +236,8 @@ impl Config {
             ConfigKey::CodeExecTimeout => self.code_exec_timeout_secs.to_string(),
             ConfigKey::WeChatBotToken => mask_secret(&self.wechat_bot_token),
             ConfigKey::WeChatBaseUrl => self.wechat_base_url.clone(),
+            ConfigKey::Orkey => mask_secret(&self.orkey),
+            ConfigKey::SleepInterval => self.sleep_interval_secs.to_string(),
         }
     }
 }

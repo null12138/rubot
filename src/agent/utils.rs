@@ -98,7 +98,9 @@ pub(super) fn subagent_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "object",
                         "properties": {
                             "task": {"type": "string", "description": "Child task"},
-                            "share_history": {"type": "boolean", "description": "Copy current conversation history", "default": false}
+                            "share_history": {"type": "boolean", "description": "Copy current conversation history", "default": false},
+                            "model": {"type": "string", "enum": ["fast", "heavy"], "description": "Which model to use; fast (default) is cheaper for simple tasks", "default": "fast"},
+                            "timeout_secs": {"type": "integer", "minimum": 10, "description": "Auto-close subagent after this many seconds"}
                         },
                         "required": ["task"]
                     }),
@@ -173,6 +175,130 @@ pub(super) fn format_subagent_snapshot(snapshot: &SubagentSnapshot) -> String {
     out
 }
 
+// ── memory tool definitions ──
+
+pub(super) fn memory_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition::new(
+            "memory_search",
+            "Search memory across all layers for relevant past context. Use before starting a task to recall related findings, user preferences, or past solutions.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search keywords"}
+                },
+                "required": ["query"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "memory_add",
+            "Store a fact, finding, or preference in memory. Use after discovering something useful that should be remembered for future tasks.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "layer": {"type": "string", "enum": ["working", "episodic", "semantic"], "description": "Memory tier: working (temporary findings), episodic (project patterns), semantic (permanent knowledge about user/preferences/conventions)", "default": "working"},
+                    "summary": {"type": "string", "description": "One-line summary (used for dedup and search)"},
+                    "content": {"type": "string", "description": "Full content to remember"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"}
+                },
+                "required": ["summary", "content"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "memory_touch",
+            "Review and strengthen a memory entry, increasing its retention. Use for due items shown in the memory index or after confirming a memory is still relevant.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Memory entry file ID (e.g. working/20260427_120000_abc12345)"}
+                },
+                "required": ["file"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "memory_due",
+            "List memory entries overdue for review (Ebbinghaus spacing). Review these with memory_touch to strengthen retention.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "tool_create",
+            "Crystallize a working solution into a reusable MD tool. Provide name, description, language, parameter schema, and code. The tool auto-registers for the next turn.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Tool name (lowercase, underscores only, e.g. get_stock_price)"},
+                    "description": {"type": "string", "description": "What the tool does, when to use it"},
+                    "language": {"type": "string", "enum": ["bash", "python"], "description": "Implementation language"},
+                    "code": {"type": "string", "description": "The script body. Bash: params come as env vars. Python: params come as JSON on stdin."},
+                    "parameters": {"type": "object", "description": "JSON Schema for tool parameters, e.g. {\"type\":\"object\",\"properties\":{\"symbol\":{\"type\":\"string\"}},\"required\":[\"symbol\"]}"}
+                },
+                "required": ["name", "description", "language", "code"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "tool_delete",
+            "Remove an MD-backed tool by name (without .md extension).",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Tool name to delete (e.g. get_stock_price)"}
+                },
+                "required": ["name"]
+            }),
+        )
+        .compact_for_llm(),
+    ]
+}
+
+/// Extract the first JSON object `{...}` from text, skipping markdown fences.
+pub(crate) fn extract_json_object(text: &str) -> Option<serde_json::Value> {
+    let text = text.trim();
+    // Strip ```json / ``` fences if present.
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .map(|s| s.strip_suffix("```").unwrap_or(s))
+        .unwrap_or(text);
+    if let Some(start) = text.find('{') {
+        let slice = &text[start..];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(slice) {
+            return Some(v);
+        }
+        // Try to find the matching closing brace.
+        let mut depth = 0i32;
+        let mut end = start;
+        for (i, ch) in text[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > start {
+            let candidate = &text[start..end];
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 // ── param summarizer ──
 
 pub(super) fn summarize_params(tool_name: &str, params: &serde_json::Value) -> String {
@@ -185,13 +311,22 @@ pub(super) fn summarize_params(tool_name: &str, params: &serde_json::Value) -> S
             .collect(),
         "web_fetch" => params["url"].as_str().unwrap_or("").to_string(),
         "web_search" => params["query"].as_str().unwrap_or("").to_string(),
-        "subagent_spawn" => params["task"]
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .take(80)
-            .collect(),
+        "subagent_spawn" => {
+            let task: String = params["task"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect();
+            let model = params["model"].as_str().unwrap_or("fast");
+            format!("[{}] {}", model, task)
+        }
         "subagent_wait" | "subagent_close" => params["id"].as_str().unwrap_or("").to_string(),
+        "memory_search" => params["query"].as_str().unwrap_or("").to_string(),
+        "memory_add" => params["summary"].as_str().unwrap_or("").to_string(),
+        "memory_touch" => params["file"].as_str().unwrap_or("").to_string(),
+        "tool_create" => params["name"].as_str().unwrap_or("").to_string(),
+        "tool_delete" => params["name"].as_str().unwrap_or("").to_string(),
         "code_exec" => {
             let lang = params["lang"]
                 .as_str()

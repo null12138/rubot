@@ -1,115 +1,56 @@
 # Rubot
 
-Minimal autonomous AI agent in Rust: LLM + core tools + flat-file memory. A Think→Act loop that runs in a terminal REPL.
+Minimal autonomous AI agent in Rust — LLM + core tools + flat-file memory. A Think→Act loop that runs in a terminal REPL. Supports WeChat as an optional message channel.
 
 ## Features
 
-- **LLM-agnostic** — works with any OpenAI-compatible API (OpenAI, Azure, Ollama, vLLM, LM Studio, etc.)
-- **Built-in tools** — `web_search`, `web_fetch`, `playwright`, `code_exec`, `file_ops`, `latex_pdf`, plus `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_close`
+- **LLM-agnostic** — any OpenAI-compatible API (OpenAI, Zhipu, DeepSeek, Ollama, vLLM, etc.)
+- **Built-in tools** — `web_search`, `web_fetch`, `browser` (headless Chromium), `code_exec`, `file_ops`, `latex_pdf`
+- **Subagents** — `subagent_spawn` / `subagent_wait` / `subagent_list` / `subagent_close` for parallel background work
 - **MD-backed tools** — drop a `.md` file in `workspace/tools/` to add new tools at runtime
 - **Flat-file memory** — three-layer Ebbinghaus-style memory (working / episodic / semantic)
-- **Child agents** — spawn background subagents for parallel work
-- **Multi-step plans** — LLM can emit a JSON plan that executes sequentially
-- **Loop mode** — drive a single task with a stop condition
+- **Multi-step plans** — LLM emits JSON plans that execute sequentially with dependency resolution
+- **Auto-loop mode** — `/loop <task>|<stop>` drives a task with a stop condition
 - **Heavy/fast model split** — first turn uses the heavy model, follow-ups use the fast model
+- **CWD-based execution** — `code_exec` runs in the directory where you launched rubot, not a sandbox
+- **Safety confirmation** — agent asks before destructive actions (delete, install packages, git mutations)
+- **WeChat channel** — optional WeChat bot via `rubot wechat` (QR login, file/media delivery)
 
-## Installation
+## Quick start
 
-### Pre-built binaries (recommended)
-
-Download the latest release for your platform from [GitHub Releases](https://github.com/null12138/rubot/releases/latest).
-
-| Platform | File |
-|---|---|
-| Linux x86_64 | `rubot-linux-amd64.tar.gz` |
-| Linux ARM64 | `rubot-linux-arm64.tar.gz` |
-| Linux ARMv7 | `rubot-linux-armhf.tar.gz` |
-| Linux x86_64 (static) | `rubot-linux-amd64-musl.tar.gz` |
-| macOS Apple Silicon | `rubot-macos-arm64.tar.gz` |
-| macOS Intel | `rubot-macos-amd64.tar.gz` |
-| Windows x86_64 | `rubot-windows-amd64.zip` |
-
-**Linux / macOS:**
+### One-line install (Linux / macOS)
 
 ```bash
-tar xzf rubot-linux-amd64.tar.gz
-sudo mv rubot /usr/local/bin/
-rubot --version
-```
-
-**Windows:**
-
-Extract `rubot.exe` from the zip and place it somewhere on your PATH, then run:
-
-```powershell
-rubot --version
-```
-
-### Install from the current checkout
-
-If you already cloned this repo, the installer auto-detects the local source tree and installs from `target/release`:
-
-```bash
-./install.sh
-./install.sh update
-./install.sh uninstall
-```
-
-### One-line install / update / uninstall
-
-**Linux / macOS:**
-
-```bash
-# Install
 curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash
-
-# Update in place
-curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash -s -- update
-
-# Uninstall
-curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | bash -s -- uninstall
 ```
 
-If you want to force a source install from a local checkout:
+If you hit permission errors, re-run with `sudo`:
 
 ```bash
-./install.sh --source
+curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | sudo bash
 ```
 
-**Windows (PowerShell):**
+### Windows
 
 ```powershell
-# Install
 irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
-
-# Update
-$env:RUBOT_INSTALL_ACTION='update'
-irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
-
-# Uninstall
-$env:RUBOT_INSTALL_ACTION='uninstall'
-irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
-
-# Optional cleanup for the current shell
-Remove-Item Env:RUBOT_INSTALL_ACTION -ErrorAction SilentlyContinue
 ```
 
-### Custom install location
-
-**Linux / macOS:**
+### First run
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/null12138/rubot/main/install.sh | \
-  RUBOT_INSTALL_DIR="$HOME/.local/bin" bash
+rubot
 ```
 
-**Windows (PowerShell):**
+On first launch, rubot uses defaults (`api.openai.com`, `gpt-4o`). Inside the REPL, configure it:
 
-```powershell
-$env:RUBOT_INSTALL_DIR="$HOME\AppData\Local\rubot\bin"
-irm https://raw.githubusercontent.com/null12138/rubot/main/install.ps1 | iex
-Remove-Item Env:RUBOT_INSTALL_DIR -ErrorAction SilentlyContinue
 ```
+/config set api_base_url https://api.openai.com/v1
+/config set api_key sk-...
+/config set model gpt-4o
+```
+
+Run `/config` to see all settings and the `.env` file path.
 
 ### Build from source
 
@@ -117,54 +58,36 @@ Remove-Item Env:RUBOT_INSTALL_DIR -ErrorAction SilentlyContinue
 git clone https://github.com/null12138/rubot.git
 cd rubot
 cargo build --release
-./target/release/rubot --version
 ./target/release/rubot
 ```
 
-## Prerequisites
-
-| | Shell | Python |
-|---|---|---|
-| **Linux** | bash (preinstalled) | `sudo apt-get install python3` |
-| **macOS** | bash (preinstalled) | `brew install python3` or Xcode CLI tools |
-| **Windows** | PowerShell (preinstalled) | [python.org](https://python.org) or `winget install Python.Python.3` |
-
-> On Windows, `lang: "bash"` in `code_exec` runs PowerShell. `lang: "python"` uses `python` (not `python3`).
-
-> `browser` controls a headless Chromium via CDP (pure Rust, no Python needed). Chrome or Chromium must be installed on the system. The browser launches lazily on first use and auto-closes after 2 minutes idle.
-
-> For autonomous browsing, prefer an inspect-act loop: start with `browser` `action=inspect`, then use the returned `target_index` entries for follow-up `click` / `fill` / `press` actions, and inspect again after navigation.
-
 ## Configuration
 
-All settings live in a global environment file, not the launch directory:
+All settings live in a **global** `.env` file — not the project directory:
 
-- macOS / Linux: `~/.config/rubot/.env`
-- Windows: `%APPDATA%\\rubot\\.env`
+| OS | Path |
+|---|---|
+| macOS / Linux | `~/.config/rubot/.env` |
+| Windows | `%APPDATA%\rubot\.env` |
+
+Override with `XDG_CONFIG_HOME` on Linux/macOS (the file lives under `$XDG_CONFIG_HOME/rubot/.env`).
+
+### Config keys
 
 | Variable | Default | Description |
 |---|---|---|
 | `RUBOT_API_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint |
 | `RUBOT_API_KEY` | `sk-placeholder` | API key |
-| `RUBOT_MODEL` | `gpt-4o` | Heavy model name |
-| `RUBOT_FAST_MODEL` | = `RUBOT_MODEL` | Fast model for follow-up turns |
-| `RUBOT_TAVILY_API_KEY` | empty | Optional Tavily key used by `web_search` before Bing fallback |
-| `RUBOT_WORKSPACE` | `workspace` | Workspace directory (relative or absolute) |
+| `RUBOT_MODEL` | `gpt-4o` | Heavy model (first turn, plans) |
+| `RUBOT_FAST_MODEL` | = `RUBOT_MODEL` | Fast model (follow-up turns with tools) |
+| `RUBOT_TAVILY_API_KEY` | empty | Tavily key for `web_search` (falls back to Bing) |
+| `RUBOT_WORKSPACE` | `workspace` | Workspace directory (absolute or relative to config dir) |
 | `RUBOT_MAX_RETRIES` | `3` | Max retries for LLM calls |
-| `RUBOT_CODE_EXEC_TIMEOUT` | `30` | `code_exec` timeout (seconds) |
+| `RUBOT_CODE_EXEC_TIMEOUT` | `30` | `code_exec` timeout in seconds |
+| `RUBOT_WECHAT_BOT_TOKEN` | empty | WeChat bot token (run `rubot wechat setup`) |
+| `RUBOT_WECHAT_BASE_URL` | `https://ilinkai.weixin.qq.com` | WeChat iLink API base |
 
-### Quick setup
-
-```bash
-rubot
-# Then inside rubot:
-/config set api_base_url https://api.openai.com/v1
-/config set api_key sk-...
-/config set tavily_api_key tvly-dev-...
-/config set model gpt-4o
-```
-
-Use `/config` inside Rubot to see the exact active global `.env` path.
+Use `/config set <key> <value>` inside rubot to update settings — changes take effect immediately.
 
 ### Local models
 
@@ -182,71 +105,115 @@ RUBOT_MODEL=meta-llama/Meta-Llama-3-8B-Instruct
 
 ## Workspace
 
-On first run, rubot creates a `workspace/` directory structure:
+On first run rubot creates the workspace directory (`workspace/` by default):
 
 ```
 workspace/
-├── files/          code_exec sandbox — generated files go here
+├── files/          Generated files, file_ops default base
 ├── tools/          MD-backed tool definitions (drop .md files here)
 └── memory/
-    ├── working/    short-term (last few hours)
-    ├── episodic/   medium-term (days)
-    └── semantic/   long-term (permanent)
+    ├── working/    Short-term (last few hours)
+    ├── episodic/   Medium-term (days)
+    └── semantic/   Long-term (permanent)
 ```
 
-If `RUBOT_WORKSPACE` is relative, it is resolved relative to the global config directory. With the default `workspace`, that means the default workspace becomes `~/.config/rubot/workspace` on macOS/Linux.
+- `code_exec` runs in the **directory where you launched rubot**, not `workspace/files/`. Generated files from both CWD and `workspace/files/` are reported after execution.
+- `file_ops` bare paths (e.g. `foo.txt`) resolve to `workspace/files/`. Use `files/...`, `tools/...`, `memory/...` or absolute paths for other locations.
 
-Set `RUBOT_WORKSPACE` to an absolute path to customize the location.
+## WeChat channel
 
-`file_ops` uses `workspace/files/` as the default base for bare relative paths like `foo.txt`, but you can also target `tools/...`, `memory/...`, `files/...`, or any absolute path on the host filesystem.
+Rubot supports WeChat (个人微信) via the iLink bot API. Start it as a standalone process:
+
+```bash
+rubot wechat
+```
+
+On first run, you need a bot token. Two ways to get one:
+
+**Option 1 — Setup inside the REPL:**
+
+```
+/wechat setup
+```
+
+This prints a QR code in the terminal. Scan it with WeChat (发现 → 扫一扫). The token is saved to `~/.config/rubot/.env` automatically.
+
+**Option 2 — Manual:**
+
+```python
+python3 -c "
+import urllib.request, json
+BASE = 'https://ilinkai.weixin.qq.com'
+h = {'iLink-App-Id': 'bot', 'iLink-App-ClientVersion': '131338'}
+# 1. Get QR code
+qr = json.loads(urllib.request.urlopen(urllib.request.Request(f'{BASE}/ilink/bot/get_bot_qrcode?bot_type=3', headers=h)).read())
+print('QR URL:', qr.get('qrcode_img_content','')[:80]+'...')
+# 2. Poll (run after scanning)
+import time
+for _ in range(60):
+    time.sleep(2)
+    r = json.loads(urllib.request.urlopen(urllib.request.Request(f'{BASE}/ilink/bot/get_qrcode_status?qrcode={qr[\"qrcode\"]}', headers=h)).read())
+    t = r.get('bot_token','')
+    if t: print('Token:', t); break
+"
+```
+
+Then set the token: `/config set wechat_bot_token <token>`
+
+After setup, run `rubot wechat` to start the bot. Files created by rubot tools are auto-delivered to WeChat.
 
 ## REPL commands
 
 | Command | Action |
 |---|---|
-| `/quit` / `/exit` | save session memory and exit |
-| `/clear` | clear terminal |
-| `/memory` | list memory index |
-| `/memory <id>` | show a memory entry |
-| `/memory search <query>` | keyword search |
-| `/memory delete <id>` | delete an entry |
-| `/memory clear` | wipe all memories |
-| `/model [name]` | show or set the heavy model |
-| `/config` | list effective config and `.env` path |
-| `/config get <key>` | show one config value |
-| `/config set <key> <value>` | save config to `.env` and apply it |
-| `/plan` | show the last executed plan |
-| `/loop <task>\|<stop>` | auto-loop on a task until stop condition |
+| `/quit` / `/exit` | Save session memory and exit |
+| `/clear` | Clear the conversation |
+| `/memory` | Show memory index |
+| `/memory search <query>` | Search memory |
+| `/memory delete <id>` | Delete an entry |
+| `/model [name]` | Show or set the heavy model |
+| `/config` | List all config and `.env` path |
+| `/config get <key>` | Show one config value |
+| `/config set <key> <value>` | Save and apply a config value |
+| `/plan` | Show the last executed plan |
+| `/loop <task>\|<stop>` | Auto-loop on a task |
+| `/wechat` | WeChat setup instructions |
+| `/wechat setup` | Scan QR code to log in |
+| `/wechat status` | Show current WeChat config |
 
 ## Project layout
 
 ```
 src/
-├── main.rs          REPL + command dispatcher
-├── agent.rs         Think→Act loop
-├── config.rs        env config
-├── personality.rs   system prompt (OS-aware)
-├── memory.rs        three-layer flat-file memory
-├── planner.rs       multi-step chain executor
-├── subagent.rs      background child-agent manager
-├── markdown.rs      terminal markdown rendering
-├── llm/             OpenAI-compatible client + types
-└── tools/           registry + built-in tools + MD-backed tools
+├── main.rs             REPL + command dispatcher
+├── agent/              Core agent (split from single agent.rs)
+│   ├── mod.rs          Agent struct, core Think→Act loop, subagents
+│   ├── plan.rs         Plan mode + auto-plan detection
+│   ├── runtime.rs      Build runtime, prompt messages, tool definitions
+│   ├── session.rs      Session persistence, history compression
+│   ├── stall.rs        Stall detection, blocked sources, recovery
+│   ├── utils.rs        Constants, helpers, tool definitions
+│   └── tests.rs        Agent tests
+├── channel/
+│   └── mod.rs          WeChat iLink channel (QR login, poll, send)
+├── config.rs           .env loading, validation, persistence
+├── personality.rs      System prompt (OS-aware, safety rules)
+├── memory.rs           Three-layer flat-file memory
+├── planner.rs          Multi-step chain executor
+├── subagent.rs         Background child-agent manager
+├── markdown.rs         Terminal markdown rendering
+├── llm/
+│   ├── client.rs       OpenAI-compatible HTTP client
+│   └── types.rs        Request/response types
+└── tools/
+    ├── mod.rs          Tool registry + MD-backed tool loading
+    ├── browser.rs      Headless Chromium via CDP
+    ├── code_exec.rs    Bash/Python execution
+    ├── file_ops.rs     File read/write/list
+    ├── latex_pdf.rs    LaTeX → PDF rendering
+    ├── web_fetch.rs    Fetch and parse web pages
+    └── web_search.rs   Web search (Tavily + Bing fallback)
 ```
-
-## Cross-compilation
-
-The CI builds 7 targets via GitHub Actions. To cross-compile locally:
-
-```bash
-# Install cross
-cargo install cross --version 0.2.5
-
-# Build for ARM64 Linux
-cross build --release --target aarch64-unknown-linux-gnu
-```
-
-See `Cross.toml` for Docker image configuration.
 
 ## License
 

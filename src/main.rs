@@ -228,11 +228,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 true,
             )
         } else {
-            let hud = rt.block_on(async {
-                agent.lock().await.usage_summary()
-            });
-            let prompt = format!("{}\n> ", hud);
-            (rl.readline(&prompt), false)
+            (rl.readline("> "), false)
         };
 
         match line {
@@ -657,11 +653,11 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 match result {
                     Ok(res) => {
                         println!("{}\n", markdown::render(&res));
+                        let hud = rt.block_on(async {
+                            agent.lock().await.usage_summary()
+                        });
+                        println!("{}\n", hud);
                         if loop_mode {
-                            let hud = rt.block_on(async {
-                                agent.lock().await.usage_summary()
-                            });
-                            println!("{}\n", hud);
                             if res.contains("TASK COMPLETE") || res.contains(&stop_condition) {
                                 loop_mode = false;
                                 println!("{}[Loop ended]{}", markdown::DIM, markdown::R);

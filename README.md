@@ -6,9 +6,10 @@ Minimal autonomous AI agent in Rust — LLM + core tools + flat-file memory. A T
 
 - **LLM-agnostic** — any OpenAI-compatible API (OpenAI, Zhipu, DeepSeek, Ollama, vLLM, etc.)
 - **Built-in tools** — `web_search`, `web_fetch`, `browser` (headless Chromium), `code_exec`, `file_ops`, `latex_pdf`
-- **Subagents** — `subagent_spawn` / `subagent_wait` / `subagent_list` / `subagent_close` for parallel background work
-- **MD-backed tools** — drop a `.md` file in `workspace/tools/` to add new tools at runtime
-- **Flat-file memory** — three-layer Ebbinghaus-style memory (working / episodic / semantic)
+- **Subagents** — `subagent_spawn` / `subagent_wait` / `subagent_list` / `subagent_close` for parallel background work; uses fast model by default, with optional timeout
+- **MD-backed tools** — `tool_create` / `tool_delete` to crystallize working solutions into reusable tools at runtime
+- **Three-tier memory** — `memory_search` / `memory_add` / `memory_touch` / `memory_due` with Ebbinghaus spacing (Working → Episodic → Semantic); the agent actively reads and writes memory during tasks
+- **Sleep/dream mode** — after idle time, a cheap LLM (OpenRouter free models if `RUBOT_ORKEY` is set, otherwise your fast model) silently consolidates working memories: merges related entries, archives patterns, evicts trivia
 - **Multi-step plans** — LLM emits JSON plans that execute sequentially with dependency resolution
 - **Auto-loop mode** — `/loop <task>|<stop>` drives a task with a stop condition
 - **Heavy/fast model split** — first turn uses the heavy model, follow-ups use the fast model
@@ -86,6 +87,8 @@ Override with `XDG_CONFIG_HOME` on Linux/macOS (the file lives under `$XDG_CONFI
 | `RUBOT_CODE_EXEC_TIMEOUT` | `30` | `code_exec` timeout in seconds |
 | `RUBOT_WECHAT_BOT_TOKEN` | empty | WeChat bot token (run `rubot wechat setup`) |
 | `RUBOT_WECHAT_BASE_URL` | `https://ilinkai.weixin.qq.com` | WeChat iLink API base |
+| `RUBOT_ORKEY` | empty | OpenRouter API key for free sleep/dream model |
+| `RUBOT_SLEEP_INTERVAL` | `300` | Idle seconds before sleep consolidation kicks in |
 
 Use `/config set <key> <value>` inside rubot to update settings — changes take effect immediately.
 
@@ -119,6 +122,37 @@ workspace/
 
 - `code_exec` runs in the **directory where you launched rubot**, not `workspace/files/`. Generated files from both CWD and `workspace/files/` are reported after execution.
 - `file_ops` bare paths (e.g. `foo.txt`) resolve to `workspace/files/`. Use `files/...`, `tools/...`, `memory/...` or absolute paths for other locations.
+
+## Memory
+
+Rubot has a three-tier Ebbinghaus memory system the agent actively uses during conversation.
+
+```
+workspace/memory/
+├── working/       Short-term (hours). Auto-evicted if not reviewed.
+├── episodic/      Medium-term (days-weeks). Promoted from working at strength ≥ 2.
+├── semantic/      Long-term (permanent). Promoted from episodic at strength ≥ 4.
+└── memory_index.md Auto-generated index
+```
+
+The agent has LLM-callable memory tools:
+- `memory_search` — search before starting a task to recall past findings
+- `memory_add` — store facts, preferences, or patterns in any layer
+- `memory_touch` — review and strengthen a memory entry
+- `memory_due` — list entries overdue for review (Ebbinghaus spacing)
+
+Each review (read, touch, or re-add with the same summary) increments the entry's strength. The decay cycle (runs every ~10 turns + at shutdown) promotes strong entries and evicts stale working entries.
+
+### Sleep / Dream mode
+
+After idle time (`RUBOT_SLEEP_INTERVAL`, default 5 min), the agent enters sleep consolidation. A separate cheap LLM:
+
+1. Reviews all working + episodic entries
+2. Merges related memories into consolidated episodic entries
+3. Archives important patterns, evicts trivia, touches valuable entries
+4. Runs the standard decay cycle
+
+If `RUBOT_ORKEY` is set, sleep mode uses OpenRouter's free models (`google/gemini-2.0-flash-exp:free`) — costing nothing. Otherwise it falls back to your configured fast model. Sleep runs in-process just before processing the next user message.
 
 ## WeChat channel
 

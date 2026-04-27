@@ -293,6 +293,7 @@ fn test_config(workspace: &PathBuf) -> Config {
         code_exec_timeout_secs: 30,
         wechat_bot_token: String::new(),
         wechat_base_url: String::new(),
+        telegram_bot_token: String::new(),
         orkey: String::new(),
         sleep_interval_secs: 300,
     }

@@ -209,6 +209,16 @@ impl SubagentManager {
     }
 }
 
+/// Run a prompt through a fresh agent and return the result. Used by scheduler.
+pub async fn run_subagent(config: crate::config::Config, prompt: &str) -> Result<String> {
+    let mut agent = crate::agent::Agent::new(config).await?;
+    agent.is_subagent = true;
+    agent.max_iterations = 8;
+    let result = agent.process(prompt).await;
+    agent.shutdown().await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SubagentManager, SubagentStatus};

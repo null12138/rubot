@@ -1,6 +1,6 @@
 use super::utils::{
     channel_send_tool_definition, compact_memory_index, memory_tool_definitions,
-    subagent_tool_definitions,
+    scheduler_tool_definitions, subagent_tool_definitions,
 };
 use super::Agent;
 use crate::config::Config;
@@ -22,9 +22,8 @@ impl Agent {
         config: &Config,
     ) -> Result<Vec<Message>> {
         let memory_index = memory
-            .get_index_text()
-            .await
-            .unwrap_or_else(|_| "(empty)".into());
+            .compact_context()
+            .await;
 
         let mut messages = vec![
             Message::system(&personality::base_system_prompt()),
@@ -106,6 +105,7 @@ impl Agent {
         let mut defs = self.tools.definitions().await;
         defs.extend(subagent_tool_definitions());
         defs.extend(memory_tool_definitions());
+        defs.extend(scheduler_tool_definitions());
         defs.push(channel_send_tool_definition());
         defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         defs

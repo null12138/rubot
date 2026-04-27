@@ -61,6 +61,8 @@ pub struct Agent {
     pub(crate) request_count: u32,
     pub billing: Option<BillingInfo>,
     pub channel_send_queue: Arc<Mutex<Vec<PathBuf>>>,
+    pub scheduler: crate::scheduler::Scheduler,
+    running_scheduled_task: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +127,7 @@ impl ToolAttempt {
 impl Agent {
     pub async fn new(config: Config) -> Result<Self> {
         let (llm, sleep_llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
+        let workspace_path = config.workspace_path.clone();
 
         let agent = Self {
             config,
@@ -150,6 +153,8 @@ impl Agent {
             request_count: 0,
             billing: None,
             channel_send_queue: Arc::new(Mutex::new(Vec::new())),
+            scheduler: crate::scheduler::Scheduler::new(&workspace_path),
+            running_scheduled_task: false,
         };
         // Run memory decay on session start so stale entries are cleaned.
         if let Ok(r) = agent.memory.decay().await {
@@ -165,6 +170,9 @@ impl Agent {
     }
 
     pub async fn process(&mut self, input: &str) -> Result<String> {
+        // Run due scheduled tasks before processing user input.
+        self.run_due_scheduled_tasks().await;
+
         // Sleep consolidation: if idle long enough, let the dream model consolidate memories.
         let idle_secs = self.last_activity.elapsed().as_secs();
         if idle_secs >= self.config.sleep_interval_secs && !self.is_subagent {
@@ -399,6 +407,11 @@ impl Agent {
             "memory_due" => self.memory_due().await,
             "tool_create" => self.tool_create(params).await,
             "tool_delete" => self.tool_delete(params).await,
+            "tool_list" => self.tool_list().await,
+            "tool_show" => self.tool_show(params).await,
+            "scheduler_add" => self.scheduler_add(params).await,
+            "scheduler_list" => self.scheduler_list().await,
+            "scheduler_remove" => self.scheduler_remove(params).await,
             _ => self.tools.execute(name, params).await,
         }
     }
@@ -653,6 +666,47 @@ impl Agent {
         Ok(ToolResult::ok(format!("Deleted tool `{}`", name)))
     }
 
+    async fn tool_list(&self) -> Result<ToolResult> {
+        let defs = self.tools.definitions().await;
+        let names: Vec<String> = defs
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Ok(ToolResult::ok("No tools registered.".into()));
+        }
+        // Show count and first 50 names
+        let count = names.len();
+        let truncated: Vec<&str> = names.iter().map(|s| s.as_str()).take(50).collect();
+        Ok(ToolResult::ok(format!(
+            "Tools ({count} total):\n{}",
+            truncated.join(", ")
+        )))
+    }
+
+    async fn tool_show(&self, params: serde_json::Value) -> Result<ToolResult> {
+        let name = params["name"].as_str().unwrap_or("").trim();
+        if name.is_empty() {
+            return Ok(ToolResult::err("missing name".into()));
+        }
+        let defs = self.tools.definitions().await;
+        let def = defs.iter().find(|d| d.function.name == name);
+        match def {
+            Some(d) => {
+                let desc = &d.function.description;
+                let params_str = serde_json::to_string_pretty(&d.function.parameters)
+                    .unwrap_or_default();
+                Ok(ToolResult::ok(format!(
+                    "## {}\n\n{}\n\n**Parameters:**\n```json\n{}\n```",
+                    name,
+                    desc,
+                    params_str,
+                )))
+            }
+            None => Ok(ToolResult::err(format!("tool `{}` not found", name))),
+        }
+    }
+
     async fn channel_send(&self, params: serde_json::Value) -> Result<ToolResult> {
         let path_str = params["path"].as_str().unwrap_or("").trim();
         if path_str.is_empty() {
@@ -688,6 +742,86 @@ impl Agent {
             "File queued for WeChat delivery: {}",
             path.display()
         )))
+    }
+
+        /// Execute due scheduled tasks. Runs each in a dedicated thread with its own tokio runtime
+    /// to break async recursion (process → run_due → run_subagent → Agent::new → process).
+    async fn run_due_scheduled_tasks(&mut self) {
+        if self.running_scheduled_task || self.is_subagent {
+            return;
+        }
+        let due: Vec<(String, String)> = self.scheduler.all().iter()
+            .filter(|t| {
+                chrono::DateTime::parse_from_rfc3339(&t.next_run)
+                    .map(|dt| dt <= chrono::Utc::now())
+                    .unwrap_or(false)
+            })
+            .map(|t| (t.id.clone(), t.prompt.clone()))
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        self.running_scheduled_task = true;
+        for (id, prompt) in &due {
+            tracing::info!("scheduler: running task {} ({})", id, prompt);
+            let cfg = self.config.clone();
+            let p = prompt.clone();
+            // Owned thread: creates its own tokio runtime, avoiding async recursion.
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("scheduler runtime");
+                rt.block_on(crate::subagent::run_subagent(cfg, &p)).ok();
+            })
+            .join()
+            .ok();
+            let _ = self.scheduler.complete_run(&id);
+        }
+        self.running_scheduled_task = false;
+    }
+
+    async fn scheduler_add(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let prompt = params["prompt"].as_str().unwrap_or("").trim().to_string();
+        let cron = params["cron"].as_str().unwrap_or("").trim().to_string();
+        if prompt.is_empty() || cron.is_empty() {
+            return Ok(ToolResult::err("missing prompt or cron".into()));
+        }
+        match self.scheduler.add(&prompt, &cron) {
+            Ok(id) => Ok(ToolResult::ok(format!(
+                "Scheduled task `{}`: \"{}\" (cron: {})",
+                id, prompt, cron
+            ))),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn scheduler_list(&self) -> Result<ToolResult> {
+        let tasks = self.scheduler.all();
+        if tasks.is_empty() {
+            return Ok(ToolResult::ok("No scheduled tasks.".into()));
+        }
+        let mut out = String::new();
+        for t in tasks {
+            let last = t.last_run.as_deref().unwrap_or("never");
+            out.push_str(&format!(
+                "- `{}` cron={} next={} last={} runs={} \"{}\"\n",
+                t.id, t.cron, t.next_run, last, t.run_count, t.prompt
+            ));
+        }
+        Ok(ToolResult::ok(out.trim_end().to_string()))
+    }
+
+    async fn scheduler_remove(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let id = params["id"].as_str().unwrap_or("").trim();
+        if id.is_empty() {
+            return Ok(ToolResult::err("missing id".into()));
+        }
+        match self.scheduler.remove(id) {
+            Ok(true) => Ok(ToolResult::ok(format!("Removed task `{}`", id))),
+            Ok(false) => Ok(ToolResult::err(format!("task `{}` not found", id))),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
     }
 
     async fn rubot_command(&mut self, params: serde_json::Value) -> Result<ToolResult> {
@@ -789,7 +923,7 @@ impl Agent {
                 Ok(ToolResult::ok(out))
             }
             "help" => Ok(ToolResult::ok(
-                "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, tavily_api_key, workspace, max_retries, code_exec_timeout".into(),
+                "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, tavily_api_key, workspace, max_retries, code_exec_timeout, sleep_interval, telegram_bot_token, orkey".into(),
             )),
             _ => Ok(ToolResult::err(
                 "usage: /config [list|get|set|help] ...".into(),
@@ -825,6 +959,7 @@ impl Agent {
         self.sleep_llm = sleep_llm;
         self.tools = tools;
         self.memory = memory;
+        self.scheduler = crate::scheduler::Scheduler::new(&self.config.workspace_path);
         self.last_plan = None;
         self.history_summary = None;
         self.restored_session_messages = 0;
@@ -876,14 +1011,6 @@ impl Agent {
         }
     }
 
-    fn fmt_num(n: u32) -> String {
-        if n >= 1_000 {
-            format!("{:.1}k", n as f64 / 1_000.0)
-        } else {
-            n.to_string()
-        }
-    }
-
     fn format_usd(amount: f64) -> String {
         if amount >= 1_000.0 {
             format!("${:.0}", amount)
@@ -896,25 +1023,16 @@ impl Agent {
         }
     }
 
-    /// Compact one-line HUD with session tokens + account billing from API.
+    /// Claude Code-style bottom bar: 5h quota · weekly usage · session tokens.
     pub fn usage_summary(&self) -> String {
-        let secs = self.session_start.elapsed().as_secs();
-        let time = if secs >= 3600 {
-            format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-        } else {
-            format!("{}m", secs / 60)
-        };
-        let mut parts: Vec<String> = vec![
-            format!("↑{} ↓{}", Self::fmt_tokens(self.prompt_tokens), Self::fmt_tokens(self.completion_tokens)),
-            format!("{} req", Self::fmt_num(self.request_count)),
-            time,
-        ];
+        let session = self.prompt_tokens + self.completion_tokens;
+        let mut parts = vec![format!("会话: {}", Self::fmt_tokens(session))];
         if let Some(b) = &self.billing {
-            parts.insert(1, b.short.clone());
+            parts.insert(0, b.short.clone());
         }
         format!(
-            "  {dim}── {} ──{reset}",
-            parts.join("  ·  "),
+            "  {dim}━━━ {} ━━━{reset}",
+            parts.join(" · "),
             reset = R,
             dim = DIM,
         )
@@ -1079,9 +1197,8 @@ impl Agent {
         None
     }
 
-    /// GLM / ZHIPU billing: queries model-usage, tool-usage, and quota endpoints.
+    /// GLM / ZHIPU billing: queries quota/limit (5h token %), model-usage (7d weekly + 24h detail).
     async fn fetch_glm_billing(&self, client: &reqwest::Client, base_url: &str, token: &str) -> Option<BillingInfo> {
-        // Extract domain: strip trailing path to get the root API domain
         let domain = if let Some(pos) = base_url.rfind("/api/") {
             &base_url[..pos]
         } else {
@@ -1089,40 +1206,47 @@ impl Agent {
         };
 
         let now = chrono::Utc::now();
-        let start = now - chrono::Duration::hours(24);
         let fmt = "%Y-%m-%d %H:%M:%S";
-        let start_time = start.format(fmt).to_string();
-        let end_time = now.format(fmt).to_string();
+        let end_str = now.format(fmt).to_string();
+        let start_24h = (now - chrono::Duration::hours(24)).format(fmt).to_string();
+        let start_7d = (now - chrono::Duration::days(7)).format(fmt).to_string();
 
         let model_url = format!("{}/api/monitor/usage/model-usage", domain);
         let tool_url = format!("{}/api/monitor/usage/tool-usage", domain);
         let quota_url = format!("{}/api/monitor/usage/quota/limit", domain);
+        let auth = token.to_string();
 
-        // Use ANTHROPIC_AUTH_TOKEN as-is (may be Bearer token or raw key)
-        let auth_header = token.to_string();
-
-        // Parallel requests
-        let (model_r, _tool_r, quota_r) = tokio::join!(
-            client.get(&model_url).query(&[("startTime", &start_time), ("endTime", &end_time)]).header("Authorization", &auth_header).send(),
-            client.get(&tool_url).query(&[("startTime", &start_time), ("endTime", &end_time)]).header("Authorization", &auth_header).send(),
-            client.get(&quota_url).header("Authorization", &auth_header).send(),
+        let (model_7d_r, model_24h_r, _tool_r, quota_r) = tokio::join!(
+            client.get(&model_url).query(&[("startTime", &start_7d), ("endTime", &end_str)]).header("Authorization", &auth).send(),
+            client.get(&model_url).query(&[("startTime", &start_24h), ("endTime", &end_str)]).header("Authorization", &auth).send(),
+            client.get(&tool_url).query(&[("startTime", &start_24h), ("endTime", &end_str)]).header("Authorization", &auth).send(),
+            client.get(&quota_url).header("Authorization", &auth).send(),
         );
 
-        let mut short = String::new();
         let mut lines: Vec<String> = Vec::new();
+        let mut five_h_pct = 0.0_f64;
+        let mut weekly_pct = 0.0_f64;
+        let mut weekly_tokens: u64 = 0;
 
-        // Parse quota limits (most important — shows token % and MCP usage %)
+        // Quota limits: extract 5h (first TOKENS) and weekly (second TOKENS) %, plus MCP %
         if let Ok(r) = quota_r {
             if r.status().is_success() {
                 if let Ok(body) = r.json::<serde_json::Value>().await {
                     let data = body.get("data").or(Some(&body)).cloned().unwrap_or(body);
                     if let Some(limits) = data.get("limits").and_then(|l| l.as_array()) {
+                        let mut tokens_seen = 0u32;
                         for limit in limits {
                             let typ = limit["type"].as_str().unwrap_or("");
                             let pct = limit["percentage"].as_f64().unwrap_or(0.0);
                             if typ.contains("TOKENS") || typ.contains("Token") {
-                                short = format!("{:.0}%", pct);
-                                lines.push(format!("Token quota (5h): {:.1}%", pct));
+                                tokens_seen += 1;
+                                if tokens_seen == 1 {
+                                    five_h_pct = pct;
+                                    lines.push(format!("Token quota (5h): {:.1}%", pct));
+                                } else {
+                                    weekly_pct = pct;
+                                    lines.push(format!("Token quota (weekly): {:.1}%", pct));
+                                }
                             } else if typ.contains("TIME") || typ.contains("MCP") {
                                 let used = limit.get("currentUsage").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 let tot = limit.get("usage").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1134,20 +1258,46 @@ impl Agent {
             }
         }
 
-        // Parse model-usage for token detail
-        if let Ok(r) = model_r {
+        // 7-day model-usage → weekly token count
+        if let Ok(r) = model_7d_r {
             if r.status().is_success() {
                 if let Ok(body) = r.json::<serde_json::Value>().await {
                     let data = body.get("data").or(Some(&body)).cloned().unwrap_or(body);
                     let pt = data.get("promptTokens").or_else(|| data.get("inputTokens"));
                     let ct = data.get("completionTokens").or_else(|| data.get("outputTokens"));
                     if let (Some(p), Some(c)) = (pt.and_then(|v| v.as_u64()), ct.and_then(|v| v.as_u64())) {
-                        lines.push(format!("Model tokens: ↑{} ↓{}", Self::fmt_tokens(p), Self::fmt_tokens(c)));
+                        weekly_tokens = p + c;
+                        lines.push(format!("Model tokens (7d): ↑{} ↓{} · 总计 {}", Self::fmt_tokens(p), Self::fmt_tokens(c), Self::fmt_tokens(weekly_tokens)));
                     }
                 }
             }
         }
 
+        // 24h model-usage → detail line
+        if let Ok(r) = model_24h_r {
+            if r.status().is_success() {
+                if let Ok(body) = r.json::<serde_json::Value>().await {
+                    let data = body.get("data").or(Some(&body)).cloned().unwrap_or(body);
+                    let pt = data.get("promptTokens").or_else(|| data.get("inputTokens"));
+                    let ct = data.get("completionTokens").or_else(|| data.get("outputTokens"));
+                    if let (Some(p), Some(c)) = (pt.and_then(|v| v.as_u64()), ct.and_then(|v| v.as_u64())) {
+                        lines.push(format!("Model tokens (24h): ↑{} ↓{}", Self::fmt_tokens(p), Self::fmt_tokens(c)));
+                    }
+                }
+            }
+        }
+
+        // Build short: "5h: 2% · 周: 63%"
+        let mut short_parts = Vec::new();
+        if five_h_pct > 0.0 {
+            short_parts.push(format!("5h: {:.0}%", five_h_pct));
+        }
+        if weekly_pct > 0.0 {
+            short_parts.push(format!("周: {:.0}%", weekly_pct));
+        } else if weekly_tokens > 0 {
+            short_parts.push(format!("周: {}", Self::fmt_tokens(weekly_tokens)));
+        }
+        let mut short = short_parts.join(" · ");
         if short.is_empty() {
             short = "quota".into();
         }

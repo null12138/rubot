@@ -4,7 +4,7 @@ use crate::subagent::SubagentSnapshot;
 // ── constants ──
 
 pub(super) const MAX_TOOL_RESULT_CHARS: usize = 2_400;
-pub(super) const MAX_MEMORY_INDEX_CHARS: usize = 3_200;
+pub(super) const MAX_MEMORY_INDEX_CHARS: usize = 1_200;
 pub(super) const MAX_HISTORY_MESSAGES: usize = 28;
 pub(super) const KEEP_RECENT_MESSAGES: usize = 12;
 pub(super) const MAX_HISTORY_CHARS: usize = 18_000;
@@ -175,6 +175,43 @@ pub(super) fn format_subagent_snapshot(snapshot: &SubagentSnapshot) -> String {
     out
 }
 
+// ── scheduler tool definitions ──
+pub(super) fn scheduler_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition::new(
+            "scheduler_add",
+            "Add a recurring scheduled task. The task runs automatically when its cron triggers. Use for periodic reminders, daily reports, monitoring, etc.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The task prompt to execute on schedule"},
+                    "cron": {"type": "string", "description": "Cron expression: minute hour day-of-month month day-of-week. Examples: '*/5 * * * *' (every 5 min), '0 * * * *' (hourly), '0 9 * * *' (daily 9am), '*/30 * * * *' (every 30 min)"}
+                },
+                "required": ["prompt", "cron"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "scheduler_list",
+            "List all scheduled tasks with their cron, next run time, and run count.",
+            serde_json::json!({"type": "object", "properties": {}, "required": []}),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "scheduler_remove",
+            "Remove a scheduled task by its ID.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Task ID to remove"}
+                },
+                "required": ["id"]
+            }),
+        )
+        .compact_for_llm(),
+    ]
+}
+
 // ── memory tool definitions ──
 
 pub(super) fn memory_tool_definitions() -> Vec<ToolDefinition> {
@@ -251,6 +288,28 @@ pub(super) fn memory_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Tool name to delete (e.g. get_stock_price)"}
+                },
+                "required": ["name"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "tool_list",
+            "List all registered tools by name. Use this to discover available tools before creating a new one.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "tool_show",
+            "Show the full definition (description, parameters) of a specific tool by name.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Tool name to inspect (e.g. web_search)"}
                 },
                 "required": ["name"]
             }),

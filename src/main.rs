@@ -6,6 +6,7 @@ mod markdown;
 mod memory;
 mod personality;
 mod planner;
+mod scheduler;
 mod subagent;
 mod tools;
 
@@ -220,6 +221,10 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
 
     loop {
         let (line, synthetic_input) = if loop_mode && !last_input.is_empty() {
+            let hud = rt.block_on(async {
+                agent.lock().await.usage_summary()
+            });
+            println!("{}\n", hud);
             (
                 Ok(format!(
                     "Continue. STOP: {}. End with 'TASK COMPLETE'.",
@@ -228,6 +233,10 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 true,
             )
         } else {
+            let hud = rt.block_on(async {
+                agent.lock().await.usage_summary()
+            });
+            print!("{}\r\n", hud);
             (rl.readline("> "), false)
         };
 
@@ -658,10 +667,6 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 match result {
                     Ok(res) => {
                         println!("{}\n", markdown::render(&res));
-                        let hud = rt.block_on(async {
-                            agent.lock().await.usage_summary()
-                        });
-                        println!("{}\n", hud);
                         if loop_mode {
                             if res.contains("TASK COMPLETE") || res.contains(&stop_condition) {
                                 loop_mode = false;

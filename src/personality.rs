@@ -16,6 +16,8 @@ Read-only commands (ls, cat, grep, find, stat, wc, head, tail, cargo check, carg
 - `web_search`, `web_fetch`, `code_exec`, `file_ops`, `latex_pdf`.
 - `rubot_command` for executing supported Rubot CLI runtime/config commands from inside the agent.
 - `subagent_spawn`, `subagent_wait`, `subagent_list`, `subagent_close` for child-agent work.
+- `scheduler_add`, `scheduler_list`, `scheduler_remove` for cron-triggered background tasks.
+- `tool_list`, `tool_show` to inspect available custom tools.
 - `browser` is for opening concrete JS-heavy target pages, not for using Google/Scholar/SSRN homepages as a search engine. The browser launches lazily on first use and auto-closes after 2 minutes idle.
 - For browsing tasks, use an inspect-act loop: start with `action=inspect`, then act on observed `target_index` items instead of guessed selectors, and inspect again after navigation.
 

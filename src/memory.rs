@@ -247,6 +247,64 @@ impl MemorySearch {
         Ok(s)
     }
 
+    /// Compact context prompt (~600-800 chars): layer counts, due items, top recent entries.
+    /// Used every turn instead of the full index to save tokens.
+    pub async fn compact_context(&self) -> String {
+        let entries = self.collect_sorted().unwrap_or_default();
+        if entries.is_empty() {
+            return "# Memory Context\n(empty)\n".into();
+        }
+
+        let total: Vec<(&str, usize)> = MemoryLayer::all()
+            .iter()
+            .map(|layer| {
+                let count = entries.iter().filter(|e| e.layer == *layer).count();
+                (layer.pretty(), count)
+            })
+            .collect();
+
+        // Due items
+        let due = self.due().await.unwrap_or_default();
+        let due_text = if due.is_empty() {
+            String::new()
+        } else {
+            let d: Vec<String> = due
+                .iter()
+                .take(3)
+                .map(|e| {
+                    format!(
+                        "`{}` — {} (s{})",
+                        e.file, e.summary, e.strength
+                    )
+                })
+                .collect();
+            format!("Due: {}\n", d.join("; "))
+        };
+
+        // Top 5 most important (sorted by prio then strength)
+        let top = entries.iter().take(5);
+        let mut top_text = String::new();
+        for e in top {
+            let tags = if e.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", e.tags.join(", "))
+            };
+            top_text.push_str(&format!("- `{}` — {}{}\n", e.file, e.summary, tags));
+        }
+
+        let counts: Vec<String> = total
+            .iter()
+            .map(|(name, count)| format!("{}: {}", name, count))
+            .collect();
+        format!(
+            "# Memory Context\n{}\n\n{}\n{}",
+            counts.join(" · "),
+            due_text,
+            top_text,
+        )
+    }
+
     pub async fn quick_search(&self, query: &str) -> Result<Vec<IndexEntry>> {
         let keywords: Vec<String> = query
             .to_lowercase()

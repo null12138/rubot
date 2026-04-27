@@ -76,7 +76,7 @@ impl RubotHelper {
         Self {
             commands: [
                 "/quit", "/exit", "/plan", "/memory", "/model", "/config", "/clear", "/loop",
-                "/wechat",
+                "/wechat", "/usage",
             ]
             .into_iter()
             .map(Into::into)
@@ -189,6 +189,7 @@ REPL commands:
   /config get <key>          Show one config value
   /config set <key> <value>  Save config to .env and apply it
   /plan                      Show the last executed plan
+  /usage                     Show session token usage and estimated cost
   /loop <task>|<stop>        Auto-loop until stop condition
   /wechat                    Show WeChat setup instructions
 
@@ -227,7 +228,11 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 true,
             )
         } else {
-            (rl.readline("> "), false)
+            let hud = rt.block_on(async {
+                agent.lock().await.usage_summary()
+            });
+            let prompt = format!("{}\n> ", hud);
+            (rl.readline(&prompt), false)
         };
 
         match line {
@@ -502,7 +507,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                 }
                                 "help" => {
                                     println!(
-                                        "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, tavily_api_key, workspace, max_retries, code_exec_timeout"
+                                        "usage:\n  /config                     list effective config\n  /config get <key>           show one config value\n  /config set <key> <value>   save to .env and apply\n\nkeys: api_base_url, api_key, model, fast_model, tavily_api_key, workspace, max_retries, code_exec_timeout, sleep_interval, orkey"
                                     );
                                 }
                                 _ => {
@@ -625,6 +630,13 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                             }
                             continue;
                         }
+                        "/usage" => {
+                            let detail = rt.block_on(async {
+                                agent.lock().await.usage_detail()
+                            });
+                            println!("\n{}\n", markdown::render(&detail));
+                            continue;
+                        }
                         _ => {
                             eprintln!("unknown command: {}", parts[0]);
                             continue;
@@ -646,6 +658,10 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                     Ok(res) => {
                         println!("{}\n", markdown::render(&res));
                         if loop_mode {
+                            let hud = rt.block_on(async {
+                                agent.lock().await.usage_summary()
+                            });
+                            println!("{}\n", hud);
                             if res.contains("TASK COMPLETE") || res.contains(&stop_condition) {
                                 loop_mode = false;
                                 println!("{}[Loop ended]{}", markdown::DIM, markdown::R);

@@ -852,6 +852,73 @@ impl Agent {
         self.last_request_start = Some(Instant::now());
     }
 
+    fn fmt_tokens(n: u64) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
+    }
+
+    fn fmt_num(n: u32) -> String {
+        if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
+    }
+
+    /// Compact one-line HUD inspired by Claude Code's status bar.
+    pub fn usage_summary(&self) -> String {
+        let elapsed = self.session_start.elapsed();
+        let secs = elapsed.as_secs();
+        let time = if secs >= 3600 {
+            format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+        } else {
+            format!("{}m", secs / 60)
+        };
+        format!(
+            "  {dim}── ↑{} ↓{}  ·  {} req  ·  {} ──{reset}",
+            Self::fmt_tokens(self.prompt_tokens),
+            Self::fmt_tokens(self.completion_tokens),
+            Self::fmt_num(self.request_count),
+            time,
+            reset = R,
+            dim = DIM,
+        )
+    }
+
+    /// Detailed usage breakdown for the /usage slash command.
+    pub fn usage_detail(&self) -> String {
+        let total = self.prompt_tokens + self.completion_tokens;
+        let secs = self.session_start.elapsed().as_secs();
+        let time = if secs >= 3600 {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        } else {
+            format!("{}m", secs / 60)
+        };
+
+        format!(
+            "Usage\n─────\n\n\
+             · Session   {time}\n\
+             · Requests  {n}\n\
+             · Prompt    {pt} tokens\n\
+             · Output    {ot} tokens\n\
+             · Total     {total} tokens\n\
+             \n\
+             {dim}Data from chat completion API responses.{reset}",
+            time = time,
+            n = self.request_count,
+            pt = Self::fmt_tokens(self.prompt_tokens),
+            ot = Self::fmt_tokens(self.completion_tokens),
+            total = Self::fmt_tokens(total),
+            dim = DIM,
+            reset = R,
+        )
+    }
+
     pub fn last_plan(&self) -> Option<&str> {
         self.last_plan.as_deref()
     }

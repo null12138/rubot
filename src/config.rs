@@ -173,7 +173,6 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
-
         Ok(Self {
             api_base_url,
             api_key,

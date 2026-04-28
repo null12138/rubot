@@ -3,6 +3,7 @@ use super::utils::{
     MAX_HISTORY_SUMMARY_CHARS,
 };
 use super::{Agent, SessionSnapshot, ToolRoundReport};
+use crate::llm::client::LlmClient;
 use crate::llm::types::{Message, Role};
 
 use std::fs;
@@ -82,6 +83,61 @@ pub(crate) fn summarize_messages(messages: &[Message]) -> String {
     truncate(&out, MAX_HISTORY_SUMMARY_CHARS)
 }
 
+/// Use the fast LLM to generate a narrative summary of dropped messages.
+/// Falls back to rule-based summarization on LLM error.
+pub(super) async fn summarize_messages_with_llm(
+    llm: &LlmClient,
+    messages: &[Message],
+    existing_summary: Option<&str>,
+) -> String {
+    if messages.is_empty() {
+        return existing_summary.unwrap_or_default().to_string();
+    }
+
+    // Format messages for the summarization prompt (max 20 to keep it quick)
+    let formatted: String = messages
+        .iter()
+        .rev()
+        .take(20)
+        .rev()
+        .filter_map(|msg| match msg.role {
+            Role::System => None,
+            Role::User => Some(format!("user: {}", truncate(msg.content.as_deref().unwrap_or(""), 200))),
+            Role::Assistant => {
+                if let Some(calls) = &msg.tool_calls {
+                    let names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+                    Some(format!("assistant [tools: {}]", names.join(", ")))
+                } else {
+                    Some(format!("assistant: {}", truncate(msg.content.as_deref().unwrap_or(""), 200)))
+                }
+            }
+            Role::Tool => Some(format!("  → {}", truncate(msg.content.as_deref().unwrap_or(""), 120))),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if formatted.trim().is_empty() {
+        return existing_summary.unwrap_or_default().to_string();
+    }
+
+    let prompt = crate::personality::conversation_summary_prompt(existing_summary, &formatted);
+    let msgs = vec![Message::user(&prompt)];
+
+    match llm.chat_fast(&msgs, None, Some(0.3)).await {
+        Ok(response) => response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .map(|t| truncate(&t, 1500))
+            .unwrap_or_else(|| summarize_messages(messages)),
+        Err(e) => {
+            tracing::warn!("LLM summarization failed, using fallback: {:#}", e);
+            summarize_messages(messages)
+        }
+    }
+}
+
 fn summarize_message(message: &Message) -> String {
     match message.role {
         Role::System => String::new(),
@@ -127,7 +183,7 @@ fn merge_history_summary(existing: Option<String>, new_summary: String) -> Optio
 // ── Agent impl ──
 
 impl Agent {
-    pub(super) fn compact_message_history(&mut self) {
+    pub(super) async fn compact_message_history(&mut self) {
         let prefix_count = self.prefix_message_count();
         if self.messages.len() <= prefix_count {
             return;
@@ -150,7 +206,14 @@ impl Agent {
 
         let dropped: Vec<Message> = self.messages[prefix_count..keep_from].to_vec();
         let recent: Vec<Message> = self.messages[keep_from..].to_vec();
-        let dropped_summary = summarize_messages(&dropped);
+
+        // Use LLM summarization for better context retention, fall back to rule-based on error
+        let dropped_summary = summarize_messages_with_llm(
+            &self.llm,
+            &dropped,
+            self.history_summary.as_deref(),
+        )
+        .await;
         self.history_summary = merge_history_summary(self.history_summary.take(), dropped_summary);
 
         self.messages.truncate(prefix_count);

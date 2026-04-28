@@ -284,7 +284,7 @@ impl Agent {
                 ));
             }
 
-            self.compact_message_history();
+            self.compact_message_history().await;
             let tool_defs = self.tool_definitions().await;
             let is_first_round = self.iteration_count == 1;
             let temp = if is_first_round { 0.7 } else { 0.3 };
@@ -380,7 +380,7 @@ impl Agent {
             if !is_first_round && response_text.trim().len() < 200 {
                 let prompt = "Based on the tool results above, provide a comprehensive answer to the user's original question.";
                 self.messages.push(Message::user(prompt));
-                self.compact_message_history();
+                self.compact_message_history().await;
                 let resp = self.llm.chat(&self.llm_messages(), None, Some(0.7)).await?;
                 self.track_usage(&resp);
                 self.request_count += 1;

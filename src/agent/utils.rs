@@ -4,11 +4,11 @@ use crate::subagent::SubagentSnapshot;
 // ── constants ──
 
 pub(super) const MAX_TOOL_RESULT_CHARS: usize = 2_400;
-pub(super) const MAX_MEMORY_INDEX_CHARS: usize = 1_200;
-pub(super) const MAX_HISTORY_MESSAGES: usize = 28;
-pub(super) const KEEP_RECENT_MESSAGES: usize = 12;
-pub(super) const MAX_HISTORY_CHARS: usize = 18_000;
-pub(super) const MAX_HISTORY_SUMMARY_CHARS: usize = 3_000;
+pub(super) const MAX_MEMORY_INDEX_CHARS: usize = 600;
+pub(super) const MAX_HISTORY_MESSAGES: usize = 20;
+pub(super) const KEEP_RECENT_MESSAGES: usize = 10;
+pub(super) const MAX_HISTORY_CHARS: usize = 14_000;
+pub(super) const MAX_HISTORY_SUMMARY_CHARS: usize = 1_500;
 pub(super) const MAX_TRACKED_TOOL_ROUNDS: usize = 6;
 pub(super) const MAX_NONCONVERGED_ITEMS: usize = 6;
 

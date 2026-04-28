@@ -282,3 +282,29 @@ Output ONLY a JSON object (no markdown, no explanation):
 Omit empty arrays. If nothing to do, respond with {{}}."#
     )
 }
+
+pub fn conversation_summary_prompt(
+    existing_summary: Option<&str>,
+    formatted_messages: &str,
+) -> String {
+    format!(
+        r#"You are a conversation summarizer. Below is a segment of a conversation between a user and an AI assistant with tool access.
+
+Summarize the segment concisely, covering:
+- What the user requested and why
+- What tools the assistant used and the results
+- Any key findings, decisions, or conclusions
+- What the current state/progress is
+
+{existing_section}Messages to summarize:
+{formatted_messages}
+
+Output ONLY the updated summary, keeping it under 500 characters. Do not add meta-commentary."#,
+        existing_section = match existing_summary {
+            Some(s) if !s.trim().is_empty() =>
+                format!("Previous summary (build upon it, don't repeat it):\n{}\n\n", s.trim()),
+            _ => String::new(),
+        },
+        formatted_messages = formatted_messages,
+    )
+}

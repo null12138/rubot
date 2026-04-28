@@ -252,56 +252,36 @@ impl MemorySearch {
     pub async fn compact_context(&self) -> String {
         let entries = self.collect_sorted().unwrap_or_default();
         if entries.is_empty() {
-            return "# Memory Context\n(empty)\n".into();
+            return String::new();
         }
 
-        let total: Vec<(&str, usize)> = MemoryLayer::all()
+        // Compact counts: "3 semantic, 2 episodic, 5 working"
+        let counts: Vec<String> = MemoryLayer::all()
             .iter()
             .map(|layer| {
                 let count = entries.iter().filter(|e| e.layer == *layer).count();
-                (layer.pretty(), count)
+                format!("{} {}", count, layer.dir())
             })
             .collect();
 
-        // Due items
-        let due = self.due().await.unwrap_or_default();
-        let due_text = if due.is_empty() {
-            String::new()
-        } else {
-            let d: Vec<String> = due
-                .iter()
-                .take(3)
-                .map(|e| {
-                    format!(
-                        "`{}` — {} (s{})",
-                        e.file, e.summary, e.strength
-                    )
-                })
-                .collect();
-            format!("Due: {}\n", d.join("; "))
-        };
-
-        // Top 5 most important (sorted by prio then strength)
-        let top = entries.iter().take(5);
-        let mut top_text = String::new();
-        for e in top {
-            let tags = if e.tags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", e.tags.join(", "))
-            };
-            top_text.push_str(&format!("- `{}` — {}{}\n", e.file, e.summary, tags));
-        }
-
-        let counts: Vec<String> = total
+        // Compact top items (max 3, one line each)
+        let top: Vec<String> = entries
             .iter()
-            .map(|(name, count)| format!("{}: {}", name, count))
+            .take(3)
+            .map(|e| {
+                let tags = if e.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", e.tags.join(", "))
+                };
+                format!("{} — {}{}", e.file, e.summary, tags)
+            })
             .collect();
+
         format!(
-            "# Memory Context\n{}\n\n{}\n{}",
-            counts.join(" · "),
-            due_text,
-            top_text,
+            "Memory: {} | {}",
+            counts.join(", "),
+            top.join(" | "),
         )
     }
 

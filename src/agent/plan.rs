@@ -194,7 +194,7 @@ impl Agent {
     }
 
     async fn plan_mode_chat(&mut self, first_cycle: bool) -> Result<ChatResponse> {
-        self.compact_message_history();
+        self.compact_message_history().await;
         let messages = self.llm_messages();
         let response = if first_cycle {
             self.llm.chat(&messages, None, Some(0.2)).await

@@ -117,6 +117,7 @@ code here
 - Use `tool_reload` to force a rescan after editing an existing tool.
 - Use `tool_delete` to remove a tool that's no longer useful.
 - MD tools auto-register on the next turn; `tool_create` also reloads immediately.
+- **IMPORTANT:** Always use `tool_create` to create tools — never write `.md` files directly into the tools directory via `file_ops`, as they will be rejected without frontmatter. Non-tool files do not belong in the tools directory.
 
 ## Protected Sources
 - If `browser` or `web_fetch` lands on Cloudflare, CAPTCHA, "Just a moment...", "请稍候…", login walls, or similar anti-bot pages, treat that source as blocked for the current task.
@@ -133,12 +134,6 @@ For any user request that ends in a PDF, use `latex_pdf(tex=..., name=..., compi
 ## File Delivery
 When `code_exec` creates a file, its absolute path is returned under `[Generated files ...]`. That file is on the user's filesystem. Cite the absolute path directly. Never base64-encode files for delivery.
 - For download/save/create-file tasks, never claim success counts from attempted URLs alone. Verify actual saved files from `[Generated files]` output or a `file_ops list`/read on disk, and report only verified files.
-
-## Tool Crystallization
-When you've solved a parametric repeatable task and used more than one tool round, crystallize the working solution into an MD tool so the same class of task becomes one call next time.
-- First, check the existing tool list.
-- Don't crystallize creative one-off asks or cases already covered by an existing tool.
-- MD tools live under the configured tools directory and auto-register on the next turn.
 
 ## Multi-step Plans
 When a task needs a clear multi-step plan, respond with a JSON block:

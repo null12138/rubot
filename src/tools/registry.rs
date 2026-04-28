@@ -199,7 +199,7 @@ impl ToolRegistry {
                     n += 1;
                 }
                 Err(e) => {
-                    tracing::warn!("md tool {}: {:#}", p.display(), e);
+                    tracing::debug!("md tool {}: {:#}", p.display(), e);
                 }
             }
         }

@@ -662,7 +662,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 if !synthetic_input && should_store_repl_history(input) {
                     let _ = rl.add_history_entry(input);
                 }
-                let result = rt.block_on(async { agent.lock().await.process(actual).await });
+                let result = rt.block_on(async { agent.lock().await.process_with_channel("cli", actual).await });
 
                 match result {
                     Ok(res) => {

@@ -125,6 +125,7 @@ impl Agent {
     }
 
     pub(super) fn replace_prefix_messages(&mut self, prefix_messages: Vec<Message>) {
+        self.prefix_messages = prefix_messages.clone();
         let prefix_count = self.prefix_message_count();
         self.messages.splice(0..prefix_count, prefix_messages);
     }

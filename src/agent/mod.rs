@@ -23,7 +23,7 @@ use crate::subagent::SubagentManager;
 use crate::tools::registry::{ToolRegistry, ToolResult};
 
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,12 +37,26 @@ pub struct BillingInfo {
     pub lines: Vec<String>,
 }
 
+/// Per-channel conversation state.
+/// Each channel/chat gets its own message history and summary,
+/// preventing context leakage between different conversations.
+#[derive(Debug)]
+pub(crate) struct ConversationState {
+    pub messages: Vec<Message>,
+    pub history_summary: Option<String>,
+    pub current_request: Option<String>,
+    pub iteration_count: u32,
+}
+
 pub struct Agent {
     pub(crate) config: Config,
     pub(crate) llm: LlmClient,
     pub(crate) sleep_llm: LlmClient,
     pub(crate) tools: ToolRegistry,
     pub(crate) memory: MemorySearch,
+    /// System prefix messages (shared across all channels)
+    pub(crate) prefix_messages: Vec<Message>,
+    /// Messages for the currently active conversation (channel-specific)
     pub(crate) messages: Vec<Message>,
     pub(crate) current_request: Option<String>,
     pub(crate) iteration_count: u32,
@@ -63,6 +77,10 @@ pub struct Agent {
     pub channel_send_queue: Arc<Mutex<Vec<PathBuf>>>,
     pub scheduler: crate::scheduler::Scheduler,
     running_scheduled_task: bool,
+    /// Active channel identifier (e.g. "repl", "tg:12345", "wx:user_abc")
+    pub(crate) current_channel: String,
+    /// Saved conversations keyed by channel identifier
+    pub(crate) conversations: HashMap<String, ConversationState>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +153,7 @@ impl Agent {
             sleep_llm,
             tools,
             memory,
+            prefix_messages: prompt_messages.clone(),
             messages: prompt_messages,
             current_request: None,
             iteration_count: 0,
@@ -155,6 +174,8 @@ impl Agent {
             channel_send_queue: Arc::new(Mutex::new(Vec::new())),
             scheduler: crate::scheduler::Scheduler::new(&workspace_path),
             running_scheduled_task: false,
+            current_channel: "repl".to_string(),
+            conversations: HashMap::new(),
         };
         // Run memory decay on session start so stale entries are cleaned.
         if let Ok(r) = agent.memory.decay().await {
@@ -170,6 +191,16 @@ impl Agent {
     }
 
     pub async fn process(&mut self, input: &str) -> Result<String> {
+        self.process_with_channel("repl", input).await
+    }
+
+    /// Process a user message from a specific channel.
+    /// Channel ID identifies the conversation context (e.g. "repl", "tg:12345", "wx:user_abc").
+    /// Each channel gets its own message history, preventing context interleaving.
+    pub async fn process_with_channel(&mut self, channel_id: &str, input: &str) -> Result<String> {
+        // Switch conversation context if channel changed
+        self.switch_to_channel(channel_id).await;
+
         // Run due scheduled tasks before processing user input.
         self.run_due_scheduled_tasks().await;
 
@@ -194,6 +225,47 @@ impl Agent {
             self.billing = self.fetch_billing().await;
         }
         result
+    }
+
+    /// Switch conversation context to a different channel.
+    /// Saves the current conversation state and restores the target channel's state.
+    /// System prefix messages are shared across all channels and preserved.
+    async fn switch_to_channel(&mut self, channel_id: &str) {
+        if self.current_channel == channel_id {
+            return;
+        }
+
+        // Save current conversation state (messages after prefix + state fields)
+        let prefix_count = self.prefix_message_count();
+        let conv_messages: Vec<Message> = if self.messages.len() > prefix_count {
+            self.messages[prefix_count..].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.conversations.insert(
+            self.current_channel.clone(),
+            ConversationState {
+                messages: conv_messages,
+                history_summary: self.history_summary.take(),
+                current_request: self.current_request.take(),
+                iteration_count: self.iteration_count,
+            },
+        );
+
+        // Restore target channel state — truncate messages back to prefix only
+        self.messages.truncate(prefix_count);
+        self.current_channel = channel_id.to_string();
+
+        if let Some(state) = self.conversations.remove(channel_id) {
+            self.messages.extend(state.messages);
+            self.history_summary = state.history_summary;
+            self.current_request = state.current_request;
+            self.iteration_count = state.iteration_count;
+        } else {
+            self.history_summary = None;
+            self.current_request = None;
+            self.iteration_count = 0;
+        }
     }
 
     async fn run_loop(&mut self) -> Result<String> {
@@ -964,6 +1036,7 @@ impl Agent {
         self.history_summary = None;
         self.restored_session_messages = 0;
 
+        self.prefix_messages = prompt_messages.clone();
         if workspace_changed {
             self.messages.clear();
             self.messages.extend(prompt_messages);
@@ -972,6 +1045,7 @@ impl Agent {
             self.completion_tokens = 0;
             self.request_count = 0;
             self.session_start = Instant::now();
+            self.conversations.clear();
         } else {
             self.replace_prefix_messages(prompt_messages);
         }
@@ -1322,12 +1396,15 @@ impl Agent {
 
     pub async fn clear_conversation(&mut self) -> Result<()> {
         let prompt_messages = Self::build_prompt_messages(&self.memory, &self.config).await?;
+        self.prefix_messages = prompt_messages.clone();
         self.messages = prompt_messages;
         self.current_request = None;
         self.history_summary = None;
         self.last_plan = None;
         self.iteration_count = 0;
         self.restored_session_messages = 0;
+        // Clear saved conversations too
+        self.conversations.clear();
         let _ = clear_session_snapshot_file(&self.config.workspace_path);
         Ok(())
     }

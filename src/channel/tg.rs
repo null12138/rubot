@@ -118,7 +118,8 @@ impl TelegramBot {
 
         tokio::spawn(async move {
             let pre_files = snapshot_files(&files_dir);
-            let response = match agent.lock().await.process(&text).await {
+            let channel_id = format!("tg:{}", chat_id);
+            let response = match agent.lock().await.process_with_channel(&channel_id, &text).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("telegram bot: agent.process error: {:#}", e);

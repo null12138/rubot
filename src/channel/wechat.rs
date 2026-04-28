@@ -298,7 +298,8 @@ impl WeChatBot {
             // Snapshot files before processing to detect new ones
             let pre_files = snapshot_files(&files_dir);
 
-            let response = match agent.lock().await.process(&agent_input).await {
+            let channel_id = format!("wx:{}", to_user);
+            let response = match agent.lock().await.process_with_channel(&channel_id, &agent_input).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("wechat bot: agent.process error: {:#}", e);

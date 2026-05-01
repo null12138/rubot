@@ -1,4 +1,4 @@
-use super::registry::{Tool, ToolResult};
+use super::registry::{RiskLevel, Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -6,9 +6,9 @@ use std::time::SystemTime;
 use tokio::process::Command;
 
 pub struct CodeExec {
-    pub timeout: u64,
-    pub dir: PathBuf,
-    pub files_dir: PathBuf,
+    timeout: u64,
+    dir: PathBuf,
+    files_dir: PathBuf,
 }
 impl CodeExec {
     pub fn new(t: u64, cwd: &Path, ws: &Path) -> Self {
@@ -24,6 +24,8 @@ impl CodeExec {
 
 #[async_trait]
 impl Tool for CodeExec {
+    fn is_concurrency_safe(&self) -> bool { false }
+    fn risk_level(&self) -> RiskLevel { RiskLevel::High }
     fn name(&self) -> &str {
         "code_exec"
     }

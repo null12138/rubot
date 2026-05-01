@@ -19,8 +19,10 @@ use crate::llm::client::LlmClient;
 use crate::llm::types::*;
 use crate::markdown::{CYAN, DIM, GREEN, R, RED};
 use crate::memory::{MemoryLayer, MemorySearch};
+use crate::planner::ToolCallChain;
+use crate::skill::{Skill, SkillType as SkillTypeEnum, SkillRegistry};
 use crate::subagent::SubagentManager;
-use crate::tools::registry::{ToolRegistry, ToolResult};
+use crate::tools::registry::{RiskLevel, ToolRegistry, ToolResult};
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -53,6 +55,7 @@ pub struct Agent {
     pub(crate) llm: LlmClient,
     pub(crate) sleep_llm: LlmClient,
     pub(crate) tools: ToolRegistry,
+    pub(crate) skills: SkillRegistry,
     pub(crate) memory: MemorySearch,
     /// System prefix messages (shared across all channels)
     pub(crate) prefix_messages: Vec<Message>,
@@ -73,6 +76,9 @@ pub struct Agent {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) request_count: u32,
+    /// Transient skill context for current request (injected into llm_messages, never stored in conversation history)
+    pub(crate) current_skill_context: Option<String>,
+    pub(crate) permission_mode: crate::tools::permission::PermissionMode,
     pub billing: Option<BillingInfo>,
     pub channel_send_queue: Arc<Mutex<Vec<PathBuf>>>,
     pub scheduler: crate::scheduler::Scheduler,
@@ -144,14 +150,25 @@ impl ToolAttempt {
 
 impl Agent {
     pub async fn new(config: Config) -> Result<Self> {
-        let (llm, sleep_llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
+        let (llm, sleep_llm, tools, skills, memory, prompt_messages) =
+            Self::build_runtime(&config).await?;
         let workspace_path = config.workspace_path.clone();
+
+        // Inject skill listing into prompt messages
+        let skill_text = skills.definitions_text().await;
+        let mut prompt_messages = prompt_messages;
+        if !skill_text.is_empty() {
+            prompt_messages.push(Message::system(&skill_text));
+        }
+
+        let permission_mode = config.permission_mode;
 
         let agent = Self {
             config,
             llm,
             sleep_llm,
             tools,
+            skills,
             memory,
             prefix_messages: prompt_messages.clone(),
             messages: prompt_messages,
@@ -170,6 +187,8 @@ impl Agent {
             prompt_tokens: 0,
             completion_tokens: 0,
             request_count: 0,
+            current_skill_context: None,
+            permission_mode,
             billing: None,
             channel_send_queue: Arc::new(Mutex::new(Vec::new())),
             scheduler: crate::scheduler::Scheduler::new(&workspace_path),
@@ -212,6 +231,7 @@ impl Agent {
         self.last_activity = Instant::now();
 
         self.current_request = Some(input.trim().to_string());
+        self.current_skill_context = None;
         self.last_request_start = Some(Instant::now());
         self.messages.push(Message::user(input));
         self.iteration_count = 0;
@@ -255,6 +275,7 @@ impl Agent {
         // Restore target channel state — truncate messages back to prefix only
         self.messages.truncate(prefix_count);
         self.current_channel = channel_id.to_string();
+        self.current_skill_context = None;
 
         if let Some(state) = self.conversations.remove(channel_id) {
             self.messages.extend(state.messages);
@@ -268,141 +289,184 @@ impl Agent {
         }
     }
 
-    async fn run_loop(&mut self) -> Result<String> {
-        let mut recent_tool_rounds = Vec::<ToolRoundReport>::new();
-        let mut stall_subagent_spawned = false;
-        loop {
-            self.iteration_count += 1;
-            if self.iteration_count > self.max_iterations {
-                tracing::warn!("Max iterations hit");
-                return Ok(self.build_nonconverged_response(
-                    &format!(
-                        "Reached maximum iterations ({}) without converging.",
-                        self.max_iterations
-                    ),
-                    &recent_tool_rounds,
-                ));
-            }
+}
 
-            self.compact_message_history().await;
-            let tool_defs = self.tool_definitions().await;
-            let is_first_round = self.iteration_count == 1;
-            let temp = if is_first_round { 0.7 } else { 0.3 };
-            let llm_messages = self.llm_messages();
-            let response = if is_first_round {
-                self.llm
-                    .chat(&llm_messages, Some(&tool_defs), Some(temp))
-                    .await
-            } else {
-                self.llm
-                    .chat_fast(&llm_messages, Some(&tool_defs), Some(temp))
-                    .await
-            }
-            .context("LLM call failed")?;
+enum IterationOutcome {
+    ToolRound(ToolRoundReport),
+    TextResponse(String),
+}
 
-            self.track_usage(&response);
-            self.request_count += 1;
+impl Agent {
+    /// Single iteration: compact → assemble → dispatch → execute/collect.
+    async fn run_iteration(&mut self, first_round: bool) -> Result<IterationOutcome> {
+        // COMPACT
+        self.compact_message_history().await;
 
-            let choice = response
-                .choices
-                .into_iter()
-                .next()
-                .context("No response from LLM")?;
-            let assistant_msg = choice.message;
-            self.messages.push(assistant_msg.clone());
+        // ASSEMBLE
+        let tool_defs = self.tool_definitions().await;
+        let llm_messages = self.llm_messages();
 
-            let tool_calls = assistant_msg.tool_calls.unwrap_or_default();
-            if !tool_calls.is_empty() {
-                let round = self.execute_tools(&tool_calls).await?;
-                for executed in &round.entries {
-                    self.messages.push(Message::tool_result(
-                        &executed.call.id,
-                        &executed
-                            .result
-                            .to_string_for_llm_limited(MAX_TOOL_RESULT_CHARS),
-                    ));
-                }
-                if !round.newly_blocked_domains.is_empty() {
-                    self.messages
-                        .push(Message::user(&stall::build_blocked_source_prompt(
-                            &round.newly_blocked_domains,
-                        )));
-                }
+        // DISPATCH
+        let temp = if first_round { 0.7 } else { 0.3 };
+        let response = if first_round {
+            self.llm.chat(&llm_messages, Some(&tool_defs), Some(temp)).await
+        } else {
+            self.llm.chat_fast(&llm_messages, Some(&tool_defs), Some(temp)).await
+        }.context("LLM call failed")?;
 
-                if let Some(repeated) =
-                    stall::repeated_failure_signatures(&recent_tool_rounds, &round)
-                {
-                    let auto_subagent_id = self
-                        .maybe_spawn_stall_diagnostic_subagent(
-                            &repeated,
-                            &mut stall_subagent_spawned,
-                        )
-                        .await;
-                    let prompt =
-                        stall::build_stall_recovery_prompt(&repeated, auto_subagent_id.as_deref());
-                    self.messages.push(Message::user(&prompt));
-                }
+        self.track_usage(&response);
+        self.request_count += 1;
 
-                recent_tool_rounds.push(round);
-                if recent_tool_rounds.len() > MAX_TRACKED_TOOL_ROUNDS {
-                    recent_tool_rounds.remove(0);
-                }
-                // Periodic memory decay every ~10 tool rounds.
-                if self.iteration_count % 10 == 0 {
-                    if let Ok(r) = self.memory.decay().await {
-                        if r.promoted + r.evicted > 0 {
-                            tracing::info!(
-                                "memory decay: promoted={} evicted={}",
-                                r.promoted,
-                                r.evicted
-                            );
-                        }
-                    }
-                }
-                continue;
-            }
+        let choice = response.choices.into_iter().next().context("No response from LLM")?;
+        let assistant_msg = choice.message;
+        self.messages.push(assistant_msg.clone());
 
-            let response_text = assistant_msg.content.unwrap_or_default();
-
-            if let Some(plan) = plan::extract_plan(&response_text) {
-                return self.run_plan_mode(Some(plan)).await;
-            }
-
-            if stall::request_needs_artifact_verification(self.current_request.as_deref())
-                && !stall::has_recent_artifact_verification(&recent_tool_rounds)
-            {
-                self.messages.push(Message::user(
-                    "Before answering, verify the exact files that were actually saved on disk. Use `[Generated files]` tool output or run `file_ops list` on the target directory. Do not count attempted downloads as success, and do not present alternative-site files as if they came from the original source unless you say so explicitly.",
-                ));
-                continue;
-            }
-
-            if !is_first_round && response_text.trim().len() < 200 {
-                let prompt = "Based on the tool results above, provide a comprehensive answer to the user's original question.";
-                self.messages.push(Message::user(prompt));
-                self.compact_message_history().await;
-                let resp = self.llm.chat(&self.llm_messages(), None, Some(0.7)).await?;
-                self.track_usage(&resp);
-                self.request_count += 1;
-                let final_text = resp
-                    .choices
-                    .into_iter()
-                    .next()
-                    .and_then(|c| c.message.content)
-                    .filter(|t| !t.trim().is_empty())
-                    .unwrap_or(response_text);
-                self.messages.pop();
-                return Ok(final_text);
-            }
-
-            return Ok(response_text);
+        let tool_calls = assistant_msg.tool_calls.unwrap_or_default();
+        if !tool_calls.is_empty() {
+            // EXECUTE
+            let round = self.execute_tools(&tool_calls).await?;
+            Ok(IterationOutcome::ToolRound(round))
+        } else {
+            let text = assistant_msg.content.unwrap_or_default();
+            Ok(IterationOutcome::TextResponse(text))
         }
     }
 
+    /// COLLECT: push tool results and stall-detection prompts into message history.
+    async fn collect_tool_round(
+        &mut self,
+        round: &ToolRoundReport,
+        recent_tool_rounds: &mut Vec<ToolRoundReport>,
+        stall_subagent_spawned: &mut bool,
+    ) {
+        for executed in &round.entries {
+            self.messages.push(Message::tool_result(
+                &executed.call.id,
+                &executed.result.to_string_for_llm_limited(MAX_TOOL_RESULT_CHARS),
+            ));
+        }
+        if !round.newly_blocked_domains.is_empty() {
+            self.messages
+                .push(Message::user(&stall::build_blocked_source_prompt(
+                    &round.newly_blocked_domains,
+                )));
+        }
+
+        if let Some(repeated) = stall::repeated_failure_signatures(recent_tool_rounds, round) {
+            let auto_subagent_id = self
+                .maybe_spawn_stall_diagnostic_subagent(&repeated, stall_subagent_spawned)
+                .await;
+            let prompt = stall::build_stall_recovery_prompt(&repeated, auto_subagent_id.as_deref());
+            self.messages.push(Message::user(&prompt));
+        }
+
+        recent_tool_rounds.push(round.clone());
+        if recent_tool_rounds.len() > MAX_TRACKED_TOOL_ROUNDS {
+            recent_tool_rounds.remove(0);
+        }
+
+        // Periodic memory decay every ~10 tool rounds.
+        if self.iteration_count.is_multiple_of(10) {
+            if let Ok(r) = self.memory.decay().await {
+                if r.promoted + r.evicted > 0 {
+                    tracing::info!("memory decay: promoted={} evicted={}", r.promoted, r.evicted);
+                }
+            }
+        }
+    }
+
+    /// EVALUATE a text response: plan extraction, artifact verification, short-response re-chat, auto-skill.
+    /// Returns Ok("") to signal the caller to continue the loop (artifact verification requested another round).
+    async fn finalize_text_response(
+        &mut self,
+        response_text: &str,
+        recent_tool_rounds: &[ToolRoundReport],
+    ) -> Result<String> {
+        // Plan extraction
+        if let Some(plan) = plan::extract_plan(response_text) {
+            return self.run_plan_mode(Some(plan)).await;
+        }
+
+        // Artifact verification
+        if stall::request_needs_artifact_verification(self.current_request.as_deref())
+            && !stall::has_recent_artifact_verification(recent_tool_rounds)
+        {
+            self.messages.push(Message::user(
+                "Before answering, verify the exact files that were actually saved on disk. Use `[Generated files]` tool output or run `file_ops list` on the target directory. Do not count attempted downloads as success, and do not present alternative-site files as if they came from the original source unless you say so explicitly.",
+            ));
+            return Ok(String::new());
+        }
+
+        // Short response re-chat
+        if self.iteration_count > 1 && response_text.trim().len() < 200 {
+            let prompt = "Based on the tool results above, provide a comprehensive answer to the user's original question.";
+            self.messages.push(Message::user(prompt));
+            self.compact_message_history().await;
+            let resp = self.llm.chat(&self.llm_messages(), None, Some(0.7)).await?;
+            self.track_usage(&resp);
+            self.request_count += 1;
+            let final_text = resp
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.message.content)
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or(response_text.to_string());
+            self.messages.pop();
+            if self.iteration_count >= 3 && !self.is_subagent {
+                let _ = self.maybe_auto_skill(recent_tool_rounds, &final_text).await;
+            }
+            return Ok(final_text);
+        }
+
+        // Auto-skill
+        if self.iteration_count >= 3 && !self.is_subagent {
+            let _ = self.maybe_auto_skill(recent_tool_rounds, response_text).await;
+        }
+        Ok(response_text.to_string())
+    }
+
+    /// Main orchestrator: compact → assemble → dispatch → execute → collect (repeat).
+    async fn run_loop(&mut self) -> Result<String> {
+        let mut recent_tool_rounds = Vec::<ToolRoundReport>::new();
+        let mut stall_subagent_spawned = false;
+        self.compute_skill_context().await;
+
+        for iteration in 1..=self.max_iterations {
+            self.iteration_count = iteration;
+            let first_round = iteration == 1;
+
+            let outcome = self.run_iteration(first_round).await?;
+
+            match outcome {
+                IterationOutcome::ToolRound(round) => {
+                    self.collect_tool_round(&round, &mut recent_tool_rounds, &mut stall_subagent_spawned).await;
+                }
+                IterationOutcome::TextResponse(text) => {
+                    let result = self.finalize_text_response(&text, &recent_tool_rounds).await?;
+                    if result.is_empty() {
+                        continue;
+                    }
+                    return Ok(result);
+                }
+            }
+        }
+
+        tracing::warn!("Max iterations hit");
+        Ok(self.build_nonconverged_response(
+            &format!("Reached maximum iterations ({}) without converging.", self.max_iterations),
+            &recent_tool_rounds,
+        ))
+    }
+
     async fn execute_tools(&mut self, tool_calls: &[ToolCall]) -> Result<ToolRoundReport> {
-        let mut entries = Vec::with_capacity(tool_calls.len());
+        let mut entries: Vec<(usize, ExecutedTool)> = Vec::with_capacity(tool_calls.len());
         let mut newly_blocked_domains = Vec::new();
-        for tc in tool_calls {
+
+        // ── Phase 1: classify + run internal tools (need &mut self) ──
+        let mut external: Vec<(usize, String, serde_json::Value, ToolCall, String)> = Vec::new();
+
+        for (i, tc) in tool_calls.iter().enumerate() {
             let params: serde_json::Value =
                 serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
             let summary = summarize_params(&tc.function.name, &params);
@@ -410,55 +474,197 @@ impl Agent {
                 "  {}→{} {}{}{} {}{}{}",
                 DIM, R, CYAN, tc.function.name, R, DIM, summary, R
             );
-            let result = match self
-                .execute_tool_call(&tc.function.name, params.clone())
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => ToolResult::err(format!("{:#}", e)),
-            };
-            let (mark, color) = if result.success {
-                ("✓", GREEN)
-            } else {
-                ("✗", RED)
-            };
-            let raw = if result.success {
-                result.output.as_str()
-            } else {
-                result.error.as_deref().unwrap_or("")
-            };
-            let preview: String = raw
-                .lines()
-                .find(|l| l.trim().len() >= 4)
-                .or_else(|| raw.lines().next())
-                .map(|l| l.trim().chars().take(80).collect())
-                .unwrap_or_default();
-            println!("    {}{}{} {}{}{}", color, mark, R, DIM, preview, R);
-            let success = result.success;
-            if let Some(domain) = stall::detect_new_blocked_domain(
-                &self.blocked_domains,
-                &tc.function.name,
-                &params,
-                &result,
-            ) {
-                self.blocked_domains.insert(domain.clone());
-                push_unique_limited(&mut newly_blocked_domains, domain, 8);
+
+            // Permission gate
+            if !self.check_tool_permission(&tc.function.name, &params).await {
+                let result = ToolResult::err(format!(
+                    "Permission denied: {} not executed (risk level exceeds permission mode '{}')",
+                    tc.function.name, self.permission_mode,
+                ));
+                Self::record_tool_result(
+                    &mut entries,
+                    &mut newly_blocked_domains,
+                    &mut self.blocked_domains,
+                    i,
+                    tc,
+                    result,
+                    &summary,
+                );
+                continue;
             }
-            entries.push(ExecutedTool {
+
+            if Self::is_internal_tool(&tc.function.name) {
+                let result = match self
+                    .execute_tool_call(&tc.function.name, params.clone())
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => ToolResult::err(format!("{:#}", e)),
+                };
+                Self::record_tool_result(
+                    &mut entries,
+                    &mut newly_blocked_domains,
+                    &mut self.blocked_domains,
+                    i,
+                    tc,
+                    result,
+                    &summary,
+                );
+            } else {
+                external.push((i, tc.function.name.clone(), params, tc.clone(), summary));
+            }
+        }
+
+        // ── Phase 2: registry-backed tools → batch dispatch ──
+        if !external.is_empty() {
+            let batch: Vec<_> = external
+                .iter()
+                .map(|(_, name, params, _, _)| (name.clone(), params.clone()))
+                .collect();
+            let results = self.tools.execute_batch(&batch).await;
+            for ((i, _name, _params, tc, summary), result) in external.into_iter().zip(results) {
+                let result = match result {
+                    Ok(r) => r,
+                    Err(e) => ToolResult::err(format!("{:#}", e)),
+                };
+                Self::record_tool_result(
+                    &mut entries,
+                    &mut newly_blocked_domains,
+                    &mut self.blocked_domains,
+                    i,
+                    &tc,
+                    result,
+                    &summary,
+                );
+            }
+        }
+
+        // Restore original call order
+        entries.sort_by_key(|(idx, _)| *idx);
+        Ok(ToolRoundReport {
+            entries: entries.into_iter().map(|(_, e)| e).collect(),
+            newly_blocked_domains,
+        })
+    }
+
+    /// Shared helper: print result, run block-detection, push entry.
+    fn record_tool_result(
+        entries: &mut Vec<(usize, ExecutedTool)>,
+        newly_blocked_domains: &mut Vec<String>,
+        blocked_domains: &mut BTreeSet<String>,
+        i: usize,
+        tc: &ToolCall,
+        result: ToolResult,
+        summary: &str,
+    ) {
+        let (mark, color) = if result.success {
+            ("✓", GREEN)
+        } else {
+            ("✗", RED)
+        };
+        let raw = if result.success {
+            result.output.as_str()
+        } else {
+            result.error.as_deref().unwrap_or("")
+        };
+        let preview: String = raw
+            .lines()
+            .find(|l| l.trim().len() >= 4)
+            .or_else(|| raw.lines().next())
+            .map(|l| l.trim().chars().take(80).collect())
+            .unwrap_or_default();
+        println!("    {}{}{} {}{}{}", color, mark, R, DIM, preview, R);
+        let success = result.success;
+        if let Some(domain) = stall::detect_new_blocked_domain(
+            blocked_domains,
+            &tc.function.name,
+            &serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({})),
+            &result,
+        ) {
+            blocked_domains.insert(domain.clone());
+            push_unique_limited(newly_blocked_domains, domain, 8);
+        }
+        entries.push((
+            i,
+            ExecutedTool {
                 call: tc.clone(),
                 result,
                 attempt: ToolAttempt {
                     name: tc.function.name.clone(),
-                    summary,
+                    summary: summary.to_string(),
                     success,
                     preview,
                 },
-            });
+            },
+        ));
+    }
+
+    /// Tools routed through `execute_tool_call`'s match arms (need &mut self).
+    /// Everything else goes through the registry and can be batched.
+    fn is_internal_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "rubot_command"
+                | "channel_send"
+                | "subagent_spawn"
+                | "subagent_wait"
+                | "subagent_list"
+                | "subagent_close"
+                | "memory_search"
+                | "memory_add"
+                | "memory_touch"
+                | "memory_due"
+                | "tool_create"
+                | "tool_delete"
+                | "tool_list"
+                | "tool_show"
+                | "scheduler_add"
+                | "scheduler_list"
+                | "scheduler_remove"
+                | "skill_run"
+                | "skill_list"
+                | "skill_create"
+                | "skill_delete"
+        )
+    }
+
+    /// Check whether a tool call is permitted under the current permission mode.
+    /// Auto-approved tools execute immediately; others go through the YOLO classifier.
+    async fn check_tool_permission(&self, name: &str, params: &serde_json::Value) -> bool {
+        let risk = self.lookup_tool_risk(name).await;
+        let Some(risk) = risk else {
+            return true; // unknown tool — allow
+        };
+        if self.permission_mode.auto_approve(risk) {
+            return true;
         }
-        Ok(ToolRoundReport {
-            entries,
-            newly_blocked_domains,
-        })
+        crate::tools::permission::yolo_classify(
+            &self.llm,
+            self.current_request.as_deref(),
+            name,
+            params,
+        )
+        .await
+    }
+
+    /// Determine the RiskLevel for a tool, checking internal tools first then the registry.
+    async fn lookup_tool_risk(&self, name: &str) -> Option<RiskLevel> {
+        // Internal tools with hardcoded risk levels
+        match name {
+            "rubot_command" | "channel_send" => Some(RiskLevel::Medium),
+            "subagent_spawn" | "subagent_close" => Some(RiskLevel::Medium),
+            "subagent_wait" | "subagent_list" => Some(RiskLevel::Low),
+            "memory_search" | "memory_add" | "memory_touch" | "memory_due" => {
+                Some(RiskLevel::Low)
+            }
+            "tool_create" | "tool_delete" => Some(RiskLevel::High),
+            "tool_list" | "tool_show" => Some(RiskLevel::Low),
+            "scheduler_add" | "scheduler_remove" => Some(RiskLevel::Medium),
+            "scheduler_list" => Some(RiskLevel::Low),
+            "skill_run" => Some(RiskLevel::Medium),
+            "skill_list" | "skill_create" | "skill_delete" => Some(RiskLevel::Low),
+            _ => self.tools.risk_level(name).await,
+        }
     }
 
     async fn execute_tool_call(
@@ -484,6 +690,10 @@ impl Agent {
             "scheduler_add" => self.scheduler_add(params).await,
             "scheduler_list" => self.scheduler_list().await,
             "scheduler_remove" => self.scheduler_remove(params).await,
+            "skill_run" => Box::pin(self.skill_run(params)).await,
+            "skill_list" => self.skill_list().await,
+            "skill_create" => self.skill_create(params).await,
+            "skill_delete" => self.skill_delete(params).await,
             _ => self.tools.execute(name, params).await,
         }
     }
@@ -848,7 +1058,7 @@ impl Agent {
             })
             .join()
             .ok();
-            let _ = self.scheduler.complete_run(&id);
+            let _ = self.scheduler.complete_run(id);
         }
         self.running_scheduled_task = false;
     }
@@ -894,6 +1104,357 @@ impl Agent {
             Ok(false) => Ok(ToolResult::err(format!("task `{}` not found", id))),
             Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
         }
+    }
+
+    pub async fn process_with_skill(
+        &mut self,
+        trigger_or_name: &str,
+        args: &str,
+    ) -> Result<String> {
+        let mut skill = self.skills.get_by_trigger(trigger_or_name).await;
+
+        // Also try matching the trigger without leading slash, or by name
+        if skill.is_none() && trigger_or_name.starts_with('/') {
+            let bare = &trigger_or_name[1..];
+            skill = self.skills.get_by_trigger(bare).await;
+            if skill.is_none() {
+                skill = self.skills.get_by_name(bare).await;
+            }
+        }
+        if skill.is_none() {
+            skill = self.skills.get_by_name(trigger_or_name).await;
+        }
+
+        let skill = match skill {
+            Some(s) => s,
+            None => {
+                let available: Vec<String> = self
+                    .skills
+                    .list()
+                    .await
+                    .iter()
+                    .map(|s| format!("  {} ({})", s.name, s.triggers.join(", ")))
+                    .collect();
+                return Err(anyhow::anyhow!(
+                    "Skill '{}' not found. Available:\n{}",
+                    trigger_or_name,
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join("\n")
+                    }
+                ));
+            }
+        };
+
+        match skill.skill_type {
+            SkillTypeEnum::Prompt => self.execute_prompt_skill(&skill, args).await,
+            SkillTypeEnum::Workflow => self.execute_workflow_skill(&skill, args).await,
+        }
+    }
+
+    async fn execute_prompt_skill(&mut self, skill: &Skill, args: &str) -> Result<String> {
+        self.messages.push(Message::system(&skill.body));
+        if !args.is_empty() {
+            self.messages.push(Message::user(args));
+        }
+        self.current_request = Some(if args.is_empty() {
+            skill.description.clone()
+        } else {
+            args.to_string()
+        });
+        self.last_request_start = Some(Instant::now());
+        self.iteration_count = 0;
+        self.run_loop().await
+    }
+
+    async fn execute_workflow_skill(&mut self, skill: &Skill, args: &str) -> Result<String> {
+        let resolved = resolve_template_vars(&skill.body, args);
+        let steps = parse_workflow_steps(&resolved)?;
+        let mut chain = ToolCallChain::new(&skill.description);
+        for step in steps {
+            chain.add_step(&step.tool, step.params, &step.description, vec![]);
+        }
+        self.current_request = Some(if args.is_empty() {
+            skill.description.clone()
+        } else {
+            args.to_string()
+        });
+        self.last_request_start = Some(Instant::now());
+        self.run_plan_mode(Some(chain)).await
+    }
+
+    async fn skill_run(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let name = params["name"].as_str().unwrap_or("").trim();
+        if name.is_empty() {
+            return Ok(ToolResult::err("missing name".into()));
+        }
+        let input = params["input"].as_str().unwrap_or("").to_string();
+        match self.process_with_skill(name, &input).await {
+            Ok(result) => Ok(ToolResult::ok(result)),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn skill_list(&self) -> Result<ToolResult> {
+        let skills = self.skills.list().await;
+        if skills.is_empty() {
+            return Ok(ToolResult::ok("No skills registered.".into()));
+        }
+        let mut lines = vec![format!("Skills ({} total):", skills.len())];
+        for s in &skills {
+            let triggers = if s.triggers.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", s.triggers.join(", "))
+            };
+            let typ = match s.skill_type {
+                SkillTypeEnum::Prompt => "prompt",
+                SkillTypeEnum::Workflow => "workflow",
+            };
+            lines.push(format!("- {} [{}]{}: {}", s.name, typ, triggers, s.description));
+        }
+        Ok(ToolResult::ok(lines.join("\n")))
+    }
+
+    async fn skill_create(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let name = params["name"].as_str().unwrap_or("").trim();
+        let description = params["description"].as_str().unwrap_or("").trim();
+        let skill_type = params["type"].as_str().unwrap_or("").trim();
+        let body = params["body"].as_str().unwrap_or("").trim();
+        if name.is_empty() || description.is_empty() || body.is_empty() {
+            return Ok(ToolResult::err(
+                "missing name, description, or body".into(),
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Ok(ToolResult::err(
+                "name must be lowercase letters, digits, underscores".into(),
+            ));
+        }
+        let triggers = params
+            .get("triggers")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let triggers_str = if triggers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "triggers: [\"{}\"]",
+                triggers.join("\", \"")
+            )
+        };
+        let md_content = format!(
+            "---\nname: {name}\ndescription: {description}\ntype: {skill_type}\n{triggers_str}\n---\n{body}\n",
+        );
+        let skills_dir = self.config.workspace_path.join("skills");
+        std::fs::create_dir_all(&skills_dir).ok();
+        let file_path = skills_dir.join(format!("{}.md", name));
+        if let Err(e) = tokio::fs::write(&file_path, &md_content).await {
+            return Ok(ToolResult::err(format!("failed to write skill: {:#}", e)));
+        }
+        match self.skills.reload().await {
+            Ok(n) => Ok(ToolResult::ok(format!(
+                "Created skill `{}` ({}) — {} skills loaded",
+                name, skill_type, n
+            ))),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    async fn skill_delete(&mut self, params: serde_json::Value) -> Result<ToolResult> {
+        let name = params["name"].as_str().unwrap_or("").trim();
+        if name.is_empty() {
+            return Ok(ToolResult::err("missing name".into()));
+        }
+        match self.skills.delete(name).await {
+            Ok(true) => Ok(ToolResult::ok(format!("Deleted skill `{}`", name))),
+            Ok(false) => Ok(ToolResult::err(format!("skill `{}` not found", name))),
+            Err(e) => Ok(ToolResult::err(format!("{:#}", e))),
+        }
+    }
+
+    /// After a multi-round task succeeds, consider auto-creating a skill.
+    /// Uses the fast model to analyze the tool history and decide whether
+    /// to crystallize the pattern into a reusable skill.
+    async fn maybe_auto_skill(
+        &mut self,
+        rounds: &[ToolRoundReport],
+        response: &str,
+    ) {
+        let request = match &self.current_request {
+            Some(r) if !r.trim().is_empty() => r.clone(),
+            _ => return,
+        };
+
+        // Build compact tool history summary
+        let mut history = String::new();
+        for (i, round) in rounds.iter().enumerate() {
+            for entry in &round.entries {
+                let mark = if entry.attempt.success { "OK" } else { "FAIL" };
+                history.push_str(&format!(
+                    "Round {}: {} [{}] {}\n",
+                    i + 1,
+                    entry.attempt.name,
+                    mark,
+                    entry.attempt.summary
+                ));
+            }
+        }
+        if history.is_empty() {
+            return;
+        }
+
+        // Ask fast model: should this become a skill?
+        let prompt = format!(
+            r#"Analyze this completed task and decide if it should be saved as a reusable skill.
+
+## User Request
+{request}
+
+## Tool History
+{history}
+
+## Response Summary
+{response_summary}
+
+Rules:
+- Create a skill ONLY if the task is parametric and reusable (not a one-off lookup or simple Q&A).
+- Do NOT create a skill for trivial tasks (< 3 tool calls), conversational Q&A, or unique one-time operations.
+- Prefer "prompt" type for strategy/pattern tasks where the LLM should follow a methodology.
+- Prefer "workflow" type only for fixed, deterministic tool sequences.
+- The skill name must be descriptive and unique (check against existing skill names if possible).
+
+Output ONLY a JSON object (no markdown):
+{{"create": false}}
+or
+{{"create": true, "name": "skill_name", "description": "one-line description", "type": "prompt", "triggers": ["/trigger"], "body": "skill instructions here"}}
+"#,
+            request = truncate(&request, 200),
+            history = truncate(&history, 600),
+            response_summary = truncate(response, 300),
+        );
+
+        let msgs = vec![Message::user(&prompt)];
+        let resp = match self.llm.chat_fast(&msgs, None, Some(0.1)).await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        self.track_usage(&resp);
+        self.request_count += 1;
+
+        let text = match resp.choices.into_iter().next() {
+            Some(c) => c.message.content.unwrap_or_default(),
+            None => return,
+        };
+
+        let plan = match extract_json_object(&text) {
+            Some(p) => p,
+            None => return,
+        };
+
+        if !plan.get("create").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return;
+        }
+
+        let name = match plan.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => return,
+        };
+
+        // Don't overwrite existing skills
+        if self.skills.get_by_name(&name).await.is_some() {
+            return;
+        }
+
+        let description = plan
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let skill_type = match plan.get("type").and_then(|v| v.as_str()) {
+            Some("workflow") => "workflow",
+            _ => "prompt",
+        };
+        let body = match plan.get("body").and_then(|v| v.as_str()) {
+            Some(b) if !b.is_empty() => b.to_string(),
+            _ => return,
+        };
+        let triggers: Vec<String> = plan
+            .get("triggers")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Create the skill file
+        let triggers_str = if triggers.is_empty() {
+            String::new()
+        } else {
+            format!("triggers: [\"{}\"]", triggers.join("\", \""))
+        };
+        let md_content = format!(
+            "---\nname: {name}\ndescription: {description}\ntype: {skill_type}\n{triggers_str}\n---\n{body}\n",
+        );
+        let skills_dir = self.config.workspace_path.join("skills");
+        std::fs::create_dir_all(&skills_dir).ok();
+        let file_path = skills_dir.join(format!("{}.md", name));
+        if tokio::fs::write(&file_path, &md_content).await.is_err() {
+            return;
+        }
+        if let Ok(n) = self.skills.reload().await {
+            tracing::info!("auto-skill: created '{}' ({} skills loaded)", name, n);
+        }
+    }
+
+    /// Compute matching skill bodies for the current request and store them
+    /// in `current_skill_context`. Called before the first LLM call in run_loop.
+    /// Unlike the old try_inject_skills, this does NOT mutate self.messages,
+    /// preventing duplicate injection across conversation turns.
+    async fn compute_skill_context(&mut self) {
+        let request = match &self.current_request {
+            Some(r) if !r.trim().is_empty() => r.trim().to_lowercase(),
+            _ => return,
+        };
+        let skills = self.skills.list().await;
+        if skills.is_empty() {
+            return;
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        for skill in &skills {
+            let name_keywords: Vec<&str> =
+                skill.name.split('_').filter(|w| w.len() > 2).collect();
+            let name_match = name_keywords.iter().any(|w| request.contains(w));
+            let trigger_match = skill
+                .triggers
+                .iter()
+                .any(|t| request.contains(t.trim_start_matches('/')));
+
+            if name_match || trigger_match {
+                parts.push(format!(
+                    "## Skill: {}\n{}\n{}\n",
+                    skill.name, skill.description, skill.body
+                ));
+            }
+        }
+
+        if parts.is_empty() {
+            return;
+        }
+        self.current_skill_context = Some(parts.join("\n"));
+        tracing::debug!("skill context: {} skills matched", parts.len());
     }
 
     async fn rubot_command(&mut self, params: serde_json::Value) -> Result<ToolResult> {
@@ -1023,13 +1584,15 @@ impl Agent {
 
     pub async fn apply_config(&mut self, config: Config) -> Result<bool> {
         let workspace_changed = self.config.workspace_path != config.workspace_path;
-        let (llm, sleep_llm, tools, memory, prompt_messages) = Self::build_runtime(&config).await?;
+        let (llm, sleep_llm, tools, skills, memory, prompt_messages) =
+            Self::build_runtime(&config).await?;
         self.subagents.abort_all().await;
 
         self.config = config;
         self.llm = llm;
         self.sleep_llm = sleep_llm;
         self.tools = tools;
+        self.skills = skills;
         self.memory = memory;
         self.scheduler = crate::scheduler::Scheduler::new(&self.config.workspace_path);
         self.last_plan = None;
@@ -1071,6 +1634,16 @@ impl Agent {
             self.completion_tokens = self
                 .completion_tokens
                 .saturating_add(usage.completion_tokens);
+            if let Some(cache_read) = usage.cache_read_input_tokens {
+                if cache_read > 0 {
+                    tracing::debug!("cache hit: read {} tokens", cache_read);
+                }
+            }
+            if let Some(cache_create) = usage.cache_creation_input_tokens {
+                if cache_create > 0 {
+                    tracing::debug!("cache miss: created {} tokens", cache_create);
+                }
+            }
         }
         self.last_request_start = Some(Instant::now());
     }
@@ -1576,7 +2149,7 @@ impl Agent {
                     .and_then(|t| t.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                     .unwrap_or_default();
-                let tags_refs: Vec<&str> = tags.iter().map(|s| *s).collect();
+                let tags_refs: Vec<&str> = tags.to_vec();
 
                 if !content.is_empty() {
                     if let Ok(rel) = self
@@ -1636,4 +2209,67 @@ impl Agent {
             }
         }
     }
+}
+
+/// Replace `{{input}}` and `{{param_name}}` template variables in skill body.
+fn resolve_template_vars(body: &str, input: &str) -> String {
+    body.replace("{{input}}", input)
+}
+
+/// Parse workflow YAML steps from a skill body.
+fn parse_workflow_steps(body: &str) -> Result<Vec<crate::skill::SkillStep>> {
+    let mut steps = Vec::new();
+    let mut current_tool = String::new();
+    let mut current_params = serde_json::Value::Null;
+    let mut current_desc = String::new();
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("steps:") || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("- tool:") {
+            if !current_tool.is_empty() {
+                steps.push(crate::skill::SkillStep {
+                    tool: current_tool,
+                    params: if current_params.is_null() {
+                        serde_json::json!({})
+                    } else {
+                        current_params
+                    },
+                    description: current_desc,
+                });
+            }
+            current_tool = trimmed
+                .strip_prefix("- tool:")
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            current_params = serde_json::Value::Null;
+            current_desc = String::new();
+        } else if trimmed.starts_with("params:") && !current_tool.is_empty() {
+            let raw = trimmed.strip_prefix("params:").unwrap_or("").trim();
+            current_params = serde_json::from_str(raw).unwrap_or(serde_json::json!({}));
+        } else if trimmed.starts_with("description:") && !current_tool.is_empty() {
+            current_desc = trimmed
+                .strip_prefix("description:")
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+        }
+    }
+    if !current_tool.is_empty() {
+        steps.push(crate::skill::SkillStep {
+            tool: current_tool,
+            params: if current_params.is_null() {
+                serde_json::json!({})
+            } else {
+                current_params
+            },
+            description: current_desc,
+        });
+    }
+    Ok(steps)
 }

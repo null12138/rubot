@@ -1,4 +1,4 @@
-use super::registry::{Tool, ToolResult};
+use super::registry::{RiskLevel, Tool, ToolResult};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::ffi::OsStr;
@@ -66,6 +66,8 @@ impl Tool for FileOps {
     fn name(&self) -> &str {
         "file_ops"
     }
+    fn is_concurrency_safe(&self) -> bool { true }
+    fn risk_level(&self) -> RiskLevel { RiskLevel::Medium }
     fn description(&self) -> &str {
         "Read, write, append, or list files. Bare relative paths use workspace `files/`; `files/`, `tools/`, and `memory/` are workspace-rooted; absolute paths are allowed."
     }

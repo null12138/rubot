@@ -19,6 +19,7 @@ pub enum ConfigKey {
     TelegramBotToken,
     Orkey,
     SleepInterval,
+    PermissionMode,
 }
 
 impl ConfigKey {
@@ -44,11 +45,12 @@ impl ConfigKey {
             }
             "orkey" | "rubot_orkey" | "openrouter_key" => Some(Self::Orkey),
             "sleep_interval" | "rubot_sleep_interval" | "sleep" => Some(Self::SleepInterval),
+            "permission_mode" | "rubot_permission_mode" | "perm" => Some(Self::PermissionMode),
             _ => None,
         }
     }
 
-    pub fn all() -> [Self; 13] {
+    pub fn all() -> [Self; 14] {
         [
             Self::ApiBaseUrl,
             Self::ApiKey,
@@ -63,6 +65,7 @@ impl ConfigKey {
             Self::TelegramBotToken,
             Self::Orkey,
             Self::SleepInterval,
+            Self::PermissionMode,
         ]
     }
 
@@ -81,6 +84,7 @@ impl ConfigKey {
             Self::TelegramBotToken => "RUBOT_TELEGRAM_BOT_TOKEN",
             Self::Orkey => "RUBOT_ORKEY",
             Self::SleepInterval => "RUBOT_SLEEP_INTERVAL",
+            Self::PermissionMode => "RUBOT_PERMISSION_MODE",
         }
     }
 
@@ -99,6 +103,7 @@ impl ConfigKey {
             Self::TelegramBotToken => "telegram_bot_token",
             Self::Orkey => "orkey",
             Self::SleepInterval => "sleep_interval",
+            Self::PermissionMode => "permission_mode",
         }
     }
 
@@ -116,6 +121,11 @@ impl ConfigKey {
                 .parse::<u64>()
                 .map(|n| n.to_string())
                 .map_err(|_| anyhow!("must be a non-negative integer")),
+            Self::PermissionMode => {
+                let mode = crate::tools::permission::PermissionMode::parse(value)
+                    .ok_or_else(|| anyhow!("invalid permission_mode (expected yolo|accept_defaults|always_ask|accept_all)"))?;
+                Ok(mode.to_string())
+            }
             _ => Ok(value.to_string()),
         }
     }
@@ -144,6 +154,7 @@ pub struct Config {
     pub telegram_bot_token: String,
     pub orkey: String,
     pub sleep_interval_secs: u64,
+    pub permission_mode: crate::tools::permission::PermissionMode,
 }
 
 impl Config {
@@ -182,6 +193,10 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
+        let permission_mode = std::env::var("RUBOT_PERMISSION_MODE")
+            .ok()
+            .and_then(|v| crate::tools::permission::PermissionMode::parse(&v))
+            .unwrap_or(crate::tools::permission::PermissionMode::Yolo);
         Ok(Self {
             api_base_url,
             api_key,
@@ -197,6 +212,7 @@ impl Config {
             telegram_bot_token,
             orkey,
             sleep_interval_secs,
+            permission_mode,
         })
     }
 
@@ -248,6 +264,7 @@ impl Config {
             ConfigKey::TelegramBotToken => mask_secret(&self.telegram_bot_token),
             ConfigKey::Orkey => mask_secret(&self.orkey),
             ConfigKey::SleepInterval => self.sleep_interval_secs.to_string(),
+            ConfigKey::PermissionMode => self.permission_mode.to_string(),
         }
     }
 }

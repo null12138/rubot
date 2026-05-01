@@ -5,7 +5,7 @@ use flate2::Compression;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::registry::{Tool, ToolResult};
+use super::registry::{RiskLevel, Tool, ToolResult};
 
 /// Online LaTeX → PDF compiler. Builds an in-memory `tar.gz` containing
 /// `main.tex` and POSTs it to latexonline.cc's `/data` endpoint, which
@@ -45,6 +45,8 @@ impl Tool for LatexPdf {
     fn name(&self) -> &str {
         "latex_pdf"
     }
+    fn is_concurrency_safe(&self) -> bool { false }
+    fn risk_level(&self) -> RiskLevel { RiskLevel::Medium }
 
     fn description(&self) -> &str {
         "Compile LaTeX source to PDF via an online service (no local LaTeX install needed). \

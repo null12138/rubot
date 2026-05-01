@@ -212,6 +212,60 @@ pub(super) fn scheduler_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+// ── skill tool definitions ──
+
+pub(super) fn skill_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition::new(
+            "skill_list",
+            "List all available skills (prompt templates and workflow recipes).",
+            serde_json::json!({"type": "object", "properties": {}, "required": []}),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "skill_run",
+            "Run a skill by name or trigger. Prompt skills inject specialized instructions; workflow skills execute a multi-step plan.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name or trigger (e.g. 'code_review' or '/review')"},
+                    "input": {"type": "string", "description": "Primary input for template variable {{input}}"}
+                },
+                "required": ["name"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "skill_create",
+            "Create a new skill. Prompt skills are reusable prompt templates; workflow skills are declarative multi-step recipes.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name (lowercase, underscores)"},
+                    "description": {"type": "string", "description": "What the skill does"},
+                    "type": {"type": "string", "enum": ["prompt", "workflow"], "description": "Skill type"},
+                    "triggers": {"type": "array", "items": {"type": "string"}, "description": "Trigger aliases (e.g. ['/review', '/cr'])"},
+                    "body": {"type": "string", "description": "Skill body: prompt text for prompt skills, YAML steps for workflow skills"}
+                },
+                "required": ["name", "description", "type", "body"]
+            }),
+        )
+        .compact_for_llm(),
+        ToolDefinition::new(
+            "skill_delete",
+            "Delete a skill by name.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name to delete"}
+                },
+                "required": ["name"]
+            }),
+        )
+        .compact_for_llm(),
+    ]
+}
+
 // ── memory tool definitions ──
 
 pub(super) fn memory_tool_definitions() -> Vec<ToolDefinition> {
@@ -386,6 +440,18 @@ pub(super) fn summarize_params(tool_name: &str, params: &serde_json::Value) -> S
         "memory_touch" => params["file"].as_str().unwrap_or("").to_string(),
         "tool_create" => params["name"].as_str().unwrap_or("").to_string(),
         "tool_delete" => params["name"].as_str().unwrap_or("").to_string(),
+        "skill_run" => {
+            let name = params["name"].as_str().unwrap_or("");
+            let input: String = params["input"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(40)
+                .collect();
+            format!("{} {}", name, input)
+        }
+        "skill_create" => params["name"].as_str().unwrap_or("").to_string(),
+        "skill_delete" => params["name"].as_str().unwrap_or("").to_string(),
         "code_exec" => {
             let lang = params["lang"]
                 .as_str()

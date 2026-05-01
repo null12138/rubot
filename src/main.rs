@@ -7,6 +7,7 @@ mod memory;
 mod personality;
 mod planner;
 mod scheduler;
+mod skill;
 mod subagent;
 mod tools;
 
@@ -77,7 +78,7 @@ impl RubotHelper {
         Self {
             commands: [
                 "/quit", "/exit", "/plan", "/memory", "/model", "/config", "/clear", "/loop",
-                "/wechat", "/usage",
+                "/skill", "/wechat", "/usage",
             ]
             .into_iter()
             .map(Into::into)
@@ -192,6 +193,9 @@ REPL commands:
   /plan                      Show the last executed plan
   /usage                     Show session token usage and estimated cost
   /loop <task>|<stop>        Auto-loop until stop condition
+  /skill                     List available skills
+  /skill run <name> [args]  Run a skill by name or trigger
+  /skill delete <name>      Delete a skill
   /wechat                    Show WeChat setup instructions
 
 Config:
@@ -645,6 +649,73 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                 agent.usage_detail()
                             });
                             println!("\n{}\n", markdown::render(&detail));
+                            continue;
+                        }
+                        "/skill" => {
+                            let sub = parts.get(1).copied().unwrap_or("list");
+                            let arg = parts.get(2..).map(|s| s.join(" ")).unwrap_or_default();
+                            match sub {
+                                "" | "list" => {
+                                    let list = rt.block_on(async {
+                                        agent.lock().await.skills.list().await
+                                    });
+                                    if list.is_empty() {
+                                        println!("(no skills)");
+                                    } else {
+                                        println!("\n# Skills\n");
+                                        for s in &list {
+                                            let triggers = if s.triggers.is_empty() { String::new() } else { format!(" ({})", s.triggers.join(", ")) };
+                                            let typ = match s.skill_type {
+                                                skill::SkillType::Prompt => "prompt",
+                                                skill::SkillType::Workflow => "workflow",
+                                            };
+                                            println!("- {} [{}]{}: {}", s.name, typ, triggers, s.description);
+                                        }
+                                        println!();
+                                    }
+                                }
+                                "run" => {
+                                    let name = parts.get(2).copied().unwrap_or("");
+                                    let run_args = parts.get(3..).map(|s| s.join(" ")).unwrap_or_default();
+                                    if name.is_empty() {
+                                        eprintln!("usage: /skill run <name> [args]");
+                                    } else {
+                                        match rt.block_on(async {
+                                            agent.lock().await.process_with_skill(name, &run_args).await
+                                        }) {
+                                            Ok(resp) => println!("{}\n", markdown::render(&resp)),
+                                            Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        }
+                                    }
+                                }
+                                "delete" => {
+                                    let name = arg.trim();
+                                    if name.is_empty() {
+                                        eprintln!("usage: /skill delete <name>");
+                                    } else {
+                                        match rt.block_on(async {
+                                            agent.lock().await.skills.delete(name).await
+                                        }) {
+                                            Ok(true) => println!("deleted skill {}", name),
+                                            Ok(false) => eprintln!("skill not found: {}", name),
+                                            Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        }
+                                    }
+                                }
+                                "help" => {
+                                    println!("usage:\n  /skill                  list skills\n  /skill run <name> [args]  run a skill\n  /skill delete <name>    delete a skill\n  /skill <trigger> [args] run skill by trigger");
+                                }
+                                _ => {
+                                    // Treat sub as a trigger name
+                                    let trigger = sub;
+                                    match rt.block_on(async {
+                                        agent.lock().await.process_with_skill(trigger, &arg).await
+                                    }) {
+                                        Ok(resp) => println!("{}\n", markdown::render(&resp)),
+                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                    }
+                                }
+                            }
                             continue;
                         }
                         _ => {

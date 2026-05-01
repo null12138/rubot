@@ -8,7 +8,6 @@ pub enum StepStatus {
     Running,
     Done,
     Failed,
-    Skipped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +96,6 @@ impl ToolCallChain {
                 StepStatus::Done => "[x]",
                 StepStatus::Failed => "[!]",
                 StepStatus::Running => "[~]",
-                StepStatus::Skipped => "[-]",
                 StepStatus::Pending => "[ ]",
             };
             md.push_str(&format!(

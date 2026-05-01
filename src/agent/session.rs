@@ -1,6 +1,6 @@
 use super::utils::{
     truncate, KEEP_RECENT_MESSAGES, MAX_HISTORY_CHARS, MAX_HISTORY_MESSAGES,
-    MAX_HISTORY_SUMMARY_CHARS,
+    MAX_HISTORY_SUMMARY_CHARS, MAX_TOOL_RESULT_CHARS,
 };
 use super::{Agent, SessionSnapshot, ToolRoundReport};
 use crate::llm::client::LlmClient;
@@ -11,6 +11,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+
+// ── standalone helpers ──
+
+/// Rough token estimate for context management.
+/// English: ~4 chars/token, CJK: ~2 chars/token, mixed: ~3.
+/// Conservative overestimate keeps us safely within context windows.
+fn estimate_tokens(messages: &[Message]) -> usize {
+    let chars: usize = messages.iter().map(|m| {
+        let content = m.content.as_deref().unwrap_or("").chars().count();
+        let tool_call = m.tool_calls.as_ref().map(|c| {
+            c.iter()
+                .map(|tc| tc.function.name.chars().count() + tc.function.arguments.chars().count())
+                .sum::<usize>()
+        }).unwrap_or(0);
+        content + tool_call
+    }).sum();
+    chars / 3 + messages.len() * 4 // header overhead per message
+}
 
 // ── standalone helpers ──
 
@@ -43,27 +61,6 @@ pub(super) fn load_session_snapshot(workspace_root: &Path) -> Result<Option<Sess
         }
     };
     Ok(Some(snapshot))
-}
-
-pub(super) fn total_message_chars(messages: &[Message]) -> usize {
-    messages.iter().map(message_char_len).sum()
-}
-
-fn message_char_len(message: &Message) -> usize {
-    let content_len = message.content.as_deref().map_or(0, |c| c.chars().count());
-    let tool_call_len = message
-        .tool_calls
-        .as_ref()
-        .map(|calls| {
-            calls
-                .iter()
-                .map(|call| {
-                    call.function.name.chars().count() + call.function.arguments.chars().count()
-                })
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-    content_len + tool_call_len
 }
 
 pub(crate) fn summarize_messages(messages: &[Message]) -> String {
@@ -189,12 +186,54 @@ impl Agent {
             return;
         }
 
-        let over_messages = self.messages.len() > MAX_HISTORY_MESSAGES;
-        let over_chars = total_message_chars(&self.messages) > MAX_HISTORY_CHARS;
-        if !over_messages && !over_chars {
+        let active: Vec<Message> = self.messages[prefix_count..].to_vec();
+        let over_messages = active.len() > MAX_HISTORY_MESSAGES;
+        let over_tokens = estimate_tokens(&active) > MAX_HISTORY_CHARS / 3;
+        if !over_messages && !over_tokens {
             return;
         }
 
+        // Tier 1: trim individual large tool results before dropping messages
+        if !over_messages {
+            let mut trimmed = 0usize;
+            for msg in &mut self.messages {
+                if msg.role == Role::Tool {
+                    if let Some(ref content) = msg.content {
+                        let char_count = content.chars().count();
+                        if char_count > MAX_TOOL_RESULT_CHARS {
+                            let half = MAX_TOOL_RESULT_CHARS / 2;
+                            let first: String = content.chars().take(half).collect();
+                            let last: String = content
+                                .chars()
+                                .rev()
+                                .take(200)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
+                            msg.content = Some(format!(
+                                "{}…\n[... truncated {} chars …]\n…{}",
+                                first,
+                                char_count.saturating_sub(MAX_TOOL_RESULT_CHARS),
+                                last,
+                            ));
+                            trimmed += 1;
+                        }
+                    }
+                }
+            }
+            if trimmed > 0 {
+                tracing::debug!("trimmed {} oversized tool results", trimmed);
+                let active2: Vec<Message> = self.messages[prefix_count..].to_vec();
+                if active2.len() <= MAX_HISTORY_MESSAGES
+                    && estimate_tokens(&active2) <= MAX_HISTORY_CHARS / 3
+                {
+                    return;
+                }
+            }
+        }
+
+        // Tier 2: drop from the middle, keep recent messages and a summary
         let keep_from = self
             .messages
             .len()
@@ -206,8 +245,8 @@ impl Agent {
 
         let dropped: Vec<Message> = self.messages[prefix_count..keep_from].to_vec();
         let recent: Vec<Message> = self.messages[keep_from..].to_vec();
+        let recent_len = recent.len();
 
-        // Use LLM summarization for better context retention, fall back to rule-based on error
         let dropped_summary = summarize_messages_with_llm(
             &self.llm,
             &dropped,
@@ -218,18 +257,45 @@ impl Agent {
 
         self.messages.truncate(prefix_count);
         self.messages.extend(recent);
+        tracing::debug!(
+            "compacted: dropped {} messages, kept {}, summary chars={}",
+            dropped.len(),
+            recent_len,
+            self.history_summary.as_ref().map_or(0, |s| s.len()),
+        );
     }
 
     pub(super) fn llm_messages(&self) -> Vec<Message> {
-        let mut out = Vec::with_capacity(self.messages.len() + 1);
+        let mut out = Vec::with_capacity(self.messages.len() + 2);
         let prefix_count = self.prefix_message_count();
+
+        // System messages (stable, avoid timestamps/volatile data here)
         out.extend(self.messages.iter().take(prefix_count).cloned());
+
+        // Transient skill context (included in prompt but never stored in messages)
+        if let Some(ref ctx) = self.current_skill_context {
+            out.push(Message::system(ctx));
+        }
+
+        // History summary — injected as a regular user message (no cache_control:
+        // its content changes each turn and would bust the cache prefix)
         if let Some(summary) = &self.history_summary {
             out.push(Message::user(summary));
         }
+
+        // Active conversation
         if self.messages.len() > prefix_count {
             out.extend(self.messages[prefix_count..].iter().cloned());
         }
+
+        // Single cache breakpoint on the LAST user/assistant message (Claude Code pattern).
+        for msg in out.iter_mut().rev() {
+            if matches!(msg.role, Role::User | Role::Assistant) {
+                msg.cache_control = Some(crate::llm::types::CacheControl::ephemeral());
+                break;
+            }
+        }
+
         out
     }
 
@@ -285,10 +351,11 @@ impl Agent {
             current_request: self.current_request.clone(),
             messages,
         };
-        fs::write(
-            session_snapshot_path(&self.config.workspace_path),
-            serde_json::to_vec_pretty(&snapshot)?,
-        )?;
+        // Atomic write: write to temp path, then rename (avoids partial writes on crash).
+        let path = session_snapshot_path(&self.config.workspace_path);
+        let tmp_path = path.with_extension("session.tmp.json");
+        fs::write(&tmp_path, serde_json::to_vec_pretty(&snapshot)?)?;
+        fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 }

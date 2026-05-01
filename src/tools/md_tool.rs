@@ -10,7 +10,7 @@ use super::code_exec::{human_size, scan_new_files};
 use super::registry::{Tool, ToolResult};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Lang {
+enum Lang {
     Bash,
     Python,
 }

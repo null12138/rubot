@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,19 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 use crate::llm::types::ToolDefinition;
+
+/// CC-style risk level for tool permission gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RiskLevel {
+    /// Read-only informational (web search, web fetch)
+    Low,
+    /// Creates files, modifies workspace (latex_pdf, browser)
+    Medium,
+    /// System-modifying (code_exec, file_ops write)
+    High,
+    /// Destructive (rm -rf, sudo, dangerous commands)
+    Critical,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -72,6 +86,18 @@ pub trait Tool: Send + Sync {
     fn is_md_backed(&self) -> bool {
         false
     }
+
+    // ── CC-style safety properties ──
+
+    /// Concurrent-safe tools can run simultaneously with other concurrent-safe tools.
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+
+    /// Risk level for permission gating.
+    fn risk_level(&self) -> RiskLevel {
+        RiskLevel::Medium
+    }
 }
 
 pub struct ToolRegistry {
@@ -101,6 +127,59 @@ impl ToolRegistry {
         *self.defs_cache.write().await = None;
     }
 
+    /// Execute multiple tool calls in a single batch.
+    ///
+    /// Tools marked `is_concurrency_safe()` run in parallel (via `join_all`).
+    /// Non-concurrent-safe tools run sequentially after the parallel batch.
+    /// Results are returned in the same order as `calls`.
+    pub async fn execute_batch(
+        &self,
+        calls: &[(String, serde_json::Value)],
+    ) -> Vec<Result<ToolResult>> {
+        let tools = self.tools.read().await;
+        let n = calls.len();
+        let mut results: Vec<Option<Result<ToolResult>>> = (0..n).map(|_| None).collect();
+
+        let mut parallel: Vec<usize> = Vec::new();
+        let mut sequential: Vec<usize> = Vec::new();
+
+        for (i, (name, _)) in calls.iter().enumerate() {
+            let tool = tools.get(name);
+            match tool {
+                Some(t) if t.is_concurrency_safe() => parallel.push(i),
+                Some(_) => sequential.push(i),
+                None => {
+                    results[i] =
+                        Some(Ok(ToolResult::err(format!("Unknown tool: {name}"))));
+                }
+            }
+        }
+
+        // Concurrent-safe tools → parallel batch
+        if !parallel.is_empty() {
+            let futures: Vec<_> = parallel
+                .iter()
+                .map(|&i| {
+                    let (name, params) = &calls[i];
+                    tools.get(name).unwrap().execute(params.clone())
+                })
+                .collect();
+            let outputs = join_all(futures).await;
+            for (&i, output) in parallel.iter().zip(outputs) {
+                results[i] = Some(output);
+            }
+        }
+
+        // Non-concurrent-safe tools → sequential
+        for &i in &sequential {
+            let (name, params) = &calls[i];
+            let output = tools.get(name).unwrap().execute(params.clone()).await;
+            results[i] = Some(output);
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
     pub async fn execute(&self, name: &str, params: serde_json::Value) -> Result<ToolResult> {
         if name == "tool_reload" {
             return match self.reload_md().await {
@@ -121,6 +200,12 @@ impl ToolRegistry {
             Some(tool) => tool.execute(params).await,
             None => Ok(ToolResult::err(format!("Unknown tool: {}", name))),
         }
+    }
+
+    /// Look up a registered tool's risk level. Returns None for unknown tools.
+    pub async fn risk_level(&self, name: &str) -> Option<RiskLevel> {
+        let tools = self.tools.read().await;
+        tools.get(name).map(|t| t.risk_level())
     }
 
     pub async fn definitions(&self) -> Vec<ToolDefinition> {

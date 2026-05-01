@@ -1,5 +1,5 @@
 use super::code_exec::scan_new_files;
-use super::registry::{Tool, ToolResult};
+use super::registry::{RiskLevel, Tool, ToolResult};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -41,7 +41,6 @@ impl BrowserTool {
             })),
         }
     }
-
     async fn ensure_browser(state: &Arc<Mutex<BrowserState>>) -> Result<Arc<Browser>> {
         {
             let s = state.lock().await;
@@ -117,6 +116,8 @@ impl Tool for BrowserTool {
     fn name(&self) -> &str {
         "browser"
     }
+    fn is_concurrency_safe(&self) -> bool { false }
+    fn risk_level(&self) -> RiskLevel { RiskLevel::Medium }
 
     fn description(&self) -> &str {
         "Control a headless Chromium browser. Supports `inspect` (returns structured snapshot of interactive elements), `click`, `fill`, `press`, `back`, `forward`, `wait`, `text`, `html`, `links`, `evaluate`, `screenshot`, and `close`. Prefer `inspect` first to discover elements by `target_index` instead of guessing selectors. The browser launches on first use and auto-closes after 2 minutes idle. Do not use as a generic search engine. Stops retrying if it hits anti-bot pages."

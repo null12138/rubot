@@ -1,6 +1,6 @@
 use super::utils::{
     channel_send_tool_definition, compact_memory_index, memory_tool_definitions,
-    scheduler_tool_definitions, subagent_tool_definitions,
+    scheduler_tool_definitions, skill_tool_definitions, subagent_tool_definitions,
 };
 use super::Agent;
 use crate::config::Config;
@@ -8,6 +8,7 @@ use crate::llm::client::LlmClient;
 use crate::llm::types::*;
 use crate::memory::MemorySearch;
 use crate::personality;
+use crate::skill::SkillRegistry;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
     browser::BrowserTool, code_exec::CodeExec, file_ops::FileOps, latex_pdf::LatexPdf,
@@ -52,6 +53,7 @@ impl Agent {
         LlmClient,
         LlmClient,
         ToolRegistry,
+        SkillRegistry,
         MemorySearch,
         Vec<Message>,
     )> {
@@ -95,10 +97,14 @@ impl Agent {
             .await;
         tools.load_md_tools().await?;
 
+        let skills_dir = config.workspace_path.join("skills");
+        let skills = SkillRegistry::new(Some(skills_dir));
+        skills.load().await?;
+
         let memory = MemorySearch::new(&config.workspace_path);
         let prompt_messages = Self::build_prompt_messages(&memory, config).await?;
 
-        Ok((llm, sleep_llm, tools, memory, prompt_messages))
+        Ok((llm, sleep_llm, tools, skills, memory, prompt_messages))
     }
 
     pub(super) async fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -106,6 +112,7 @@ impl Agent {
         defs.extend(subagent_tool_definitions());
         defs.extend(memory_tool_definitions());
         defs.extend(scheduler_tool_definitions());
+        defs.extend(skill_tool_definitions());
         defs.push(channel_send_tool_definition());
         defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         defs

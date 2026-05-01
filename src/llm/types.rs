@@ -9,6 +9,23 @@ pub enum Role {
     Tool,
 }
 
+/// Anthropic-style prompt cache control marker.
+/// When supported by the API, tells the server to cache content up
+/// to this point for reuse across requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
+impl CacheControl {
+    pub fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -17,6 +34,11 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Prompt cache breakpoint. Set on the last message of a
+    /// stable prefix (system messages, tools, conversation history)
+    /// to maximize cache hits on repeating context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,8 +96,12 @@ pub struct Usage {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub completion_tokens: u64,
+    /// Anthropic/OpenAI cache creation tokens (optional, provider-specific).
     #[serde(default)]
-    pub total_tokens: u64,
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Anthropic/OpenAI cache read tokens (optional, provider-specific).
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +126,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            cache_control: None,
         }
     }
     pub fn system(c: &str) -> Self {
@@ -114,6 +141,7 @@ impl Message {
             content: Some(c.into()),
             tool_calls: None,
             tool_call_id: Some(id.into()),
+            cache_control: None,
         }
     }
     pub fn tool_result(id: &str, c: &str) -> Self {

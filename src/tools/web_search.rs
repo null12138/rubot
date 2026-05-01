@@ -1,4 +1,4 @@
-use super::registry::{Tool, ToolResult};
+use super::registry::{RiskLevel, Tool, ToolResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Url;
@@ -82,6 +82,8 @@ impl Tool for WebSearch {
     fn description(&self) -> &str {
         "Search the web via Tavily when configured, with Bing as fallback."
     }
+    fn is_concurrency_safe(&self) -> bool { true }
+    fn risk_level(&self) -> RiskLevel { RiskLevel::Low }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}, "max": {"type": "integer"}}, "required": ["query"]})
     }

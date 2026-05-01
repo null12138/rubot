@@ -171,8 +171,7 @@ fn new_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_next_run, Scheduler, ScheduledTask};
-    use std::path::Path;
+    use super::{compute_next_run, Scheduler};
 
     #[test]
     fn compute_next_run_every_n() {

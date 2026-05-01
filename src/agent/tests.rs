@@ -296,5 +296,6 @@ fn test_config(workspace: &PathBuf) -> Config {
         telegram_bot_token: String::new(),
         orkey: String::new(),
         sleep_interval_secs: 300,
+        permission_mode: crate::tools::permission::PermissionMode::Yolo,
     }
 }

@@ -1,4 +1,4 @@
-use super::registry::{Tool, ToolResult};
+use super::registry::{RiskLevel, Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -13,6 +13,8 @@ impl Tool for WebFetch {
     fn name(&self) -> &str {
         "web_fetch"
     }
+    fn is_concurrency_safe(&self) -> bool { true }
+    fn risk_level(&self) -> RiskLevel { RiskLevel::Low }
     fn description(&self) -> &str {
         "Fetch a URL as text."
     }

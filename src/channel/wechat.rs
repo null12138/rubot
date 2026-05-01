@@ -508,17 +508,17 @@ async fn upload_media_file(
     let file_key = timestamp_id();
     let media_type = if is_image { 1 } else { 3 }; // 1=IMAGE, 3=FILE (per types.ts)
 
-    let upload_url = get_upload_url(
+    let upload_url = get_upload_url(UploadParams {
         base_url,
         bot_token,
         to_user,
-        &file_key,
+        file_key: &file_key,
         media_type,
         raw_size,
-        &raw_md5,
+        raw_md5: &raw_md5,
         encrypted_size,
-        &key_hex,
-    )
+        aes_key_hex: &key_hex,
+    })
     .await?;
 
     let download_param = upload_to_cdn(&upload_url, &encrypted).await?;
@@ -534,36 +534,38 @@ async fn upload_media_file(
     })
 }
 
-/// Get CDN pre-signed upload URL. Returns the upload_full_url.
-async fn get_upload_url(
-    base_url: &str,
-    bot_token: &str,
-    to_user: &str,
-    file_key: &str,
+struct UploadParams<'a> {
+    base_url: &'a str,
+    bot_token: &'a str,
+    to_user: &'a str,
+    file_key: &'a str,
     media_type: i64,
     raw_size: u64,
-    raw_md5: &str,
+    raw_md5: &'a str,
     encrypted_size: u64,
-    aes_key_hex: &str,
-) -> Result<String> {
+    aes_key_hex: &'a str,
+}
+
+/// Get CDN pre-signed upload URL. Returns the upload_full_url.
+async fn get_upload_url(p: UploadParams<'_>) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 
     let body = serde_json::json!({
-        "filekey": file_key,
-        "media_type": media_type,
-        "to_user_id": to_user,
-        "rawsize": raw_size,
-        "rawfilemd5": raw_md5,
-        "filesize": encrypted_size,
+        "filekey": p.file_key,
+        "media_type": p.media_type,
+        "to_user_id": p.to_user,
+        "rawsize": p.raw_size,
+        "rawfilemd5": p.raw_md5,
+        "filesize": p.encrypted_size,
         "no_need_thumb": true,
-        "aeskey": aes_key_hex,
+        "aeskey": p.aes_key_hex,
     });
 
     let resp: Value = client
-        .post(format!("{}/ilink/bot/getuploadurl", base_url))
-        .headers(make_headers(Some(bot_token)))
+        .post(format!("{}/ilink/bot/getuploadurl", p.base_url))
+        .headers(make_headers(Some(p.bot_token)))
         .json(&body)
         .send()
         .await?
@@ -637,7 +639,7 @@ fn aes128_ecb_encrypt(plaintext: &[u8], key_hex: &str) -> Result<Vec<u8>> {
     let block_size = 16;
     let pad_len = block_size - (plaintext.len() % block_size);
     let mut data = plaintext.to_vec();
-    data.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+    data.extend(std::iter::repeat_n(pad_len as u8, pad_len));
 
     for chunk in data.chunks_exact_mut(block_size) {
         let block = GenericArray::from_mut_slice(chunk);
@@ -948,7 +950,7 @@ fn random_hex_key() -> String {
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         anyhow::bail!("invalid hex length: {}", s.len());
     }
     (0..s.len())

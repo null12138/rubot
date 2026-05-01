@@ -471,7 +471,7 @@ impl Agent {
                 serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
             let summary = summarize_params(&tc.function.name, &params);
             println!(
-                "  {}→{} {}{}{} {}{}{}",
+                "  {}┈{} {}{}{} {}{}{}",
                 DIM, R, CYAN, tc.function.name, R, DIM, summary, R
             );
 
@@ -573,7 +573,7 @@ impl Agent {
             .or_else(|| raw.lines().next())
             .map(|l| l.trim().chars().take(80).collect())
             .unwrap_or_default();
-        println!("    {}{}{} {}{}{}", color, mark, R, DIM, preview, R);
+        println!("  {}{}{} {}{}{}", color, mark, R, DIM, preview, R);
         let success = result.success;
         if let Some(domain) = stall::detect_new_blocked_domain(
             blocked_domains,

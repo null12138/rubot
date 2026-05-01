@@ -117,13 +117,32 @@ async fn main() -> anyhow::Result<()> {
     let agent = Arc::new(Mutex::new(agent::Agent::new(config).await?));
     let restored_messages = agent.lock().await.restored_session_messages();
 
-    println!("rubot {} — /quit to exit", env!("CARGO_PKG_VERSION"));
+    println!(
+        "{}┌─ rubot {} ─────────────────────────────────────┐{}\n\
+         {}│ Terminal AI agent · /quit to exit              │{}",
+        markdown::DIM,
+        env!("CARGO_PKG_VERSION"),
+        markdown::R,
+        markdown::DIM,
+        markdown::R,
+    );
     if restored_messages > 0 {
         println!(
-            "{}[restored {} session messages]{}",
+            "{}│ {}{}[restored {} session messages]{}             │\n\
+             {}└──────────────────────────────────────────────────────┘{}",
+            markdown::DIM,
+            markdown::R,
             markdown::DIM,
             restored_messages,
-            markdown::R
+            markdown::R,
+            markdown::DIM,
+            markdown::R,
+        );
+    } else {
+        println!(
+            "{}└──────────────────────────────────────────────────────┘{}",
+            markdown::DIM,
+            markdown::R,
         );
     }
     tokio::task::spawn_blocking(move || run_repl(agent)).await??;
@@ -169,43 +188,46 @@ fn parse_startup_action(args: impl IntoIterator<Item = String>) -> anyhow::Resul
 }
 
 fn print_help() {
+    let c = markdown::CYAN;
+    let d = markdown::DIM;
+    let b = markdown::BOLD;
+    let r = markdown::R;
     println!(
         "\
-rubot {version}
+{b}rubot {ver}{r}
 
-Usage:
-  rubot                 Start interactive REPL
-  rubot wechat          Start WeChat bot (requires RUBOT_WECHAT_BOT_TOKEN)
-  rubot --help
-  rubot --version
+{d}Terminal AI agent with built-in tools, memory, planning, and subagents.{r}
 
-Description:
-  Terminal AI agent with built-in tools, memory, planning, and subagents.
+{b}Usage:{r}
+  {c}rubot{r}                 {d}Start interactive REPL{r}
+  {c}rubot wechat{r}          {d}Start WeChat bot (requires RUBOT_WECHAT_BOT_TOKEN){r}
+  {c}rubot --help{r}
+  {c}rubot --version{r}
 
-REPL commands:
-  /quit / /exit              Save session memory and exit
-  /clear                     Clear the conversation and screen
-  /memory                    Show memory index
-  /model [name]              Show or set the heavy model
-  /config                    List effective config and .env path
-  /config get <key>          Show one config value
-  /config set <key> <value>  Save config to .env and apply it
-  /plan                      Show the last executed plan
-  /usage                     Show session token usage and estimated cost
-  /loop <task>|<stop>        Auto-loop until stop condition
-  /skill                     List available skills
-  /skill run <name> [args]  Run a skill by name or trigger
-  /skill delete <name>      Delete a skill
-  /wechat                    Show WeChat setup instructions
+{b}REPL commands:{r}
+  {c}/quit{r} / {c}/exit{r}        {d}Save session memory and exit{r}
+  {c}/clear{r}                {d}Clear the conversation and screen{r}
+  {c}/memory{r}                {d}Show memory index{r}
+  {c}/model{r} [name]         {d}Show or set the heavy model{r}
+  {c}/config{r}                {d}List effective config and .env path{r}
+  {c}/config get{r} <key>     {d}Show one config value{r}
+  {c}/config set{r} <key> <v> {d}Save config to .env and apply it{r}
+  {c}/plan{r}                  {d}Show the last executed plan{r}
+  {c}/usage{r}                 {d}Show session token usage and estimated cost{r}
+  {c}/loop{r} <task>|<stop>  {d}Auto-loop until stop condition{r}
+  {c}/skill{r}                 {d}List available skills{r}
+  {c}/skill run{r} <name>     {d}Run a skill by name or trigger{r}
+  {c}/skill delete{r} <name>  {d}Delete a skill{r}
+  {c}/wechat{r}                {d}Show WeChat setup instructions{r}
 
-Config:
-  Reads a global .env from the Rubot config directory.
-  Common keys: RUBOT_API_BASE_URL, RUBOT_API_KEY, RUBOT_MODEL,
-  RUBOT_FAST_MODEL, RUBOT_TAVILY_API_KEY, RUBOT_WORKSPACE,
-  RUBOT_MAX_RETRIES, RUBOT_CODE_EXEC_TIMEOUT.
-  WeChat keys: RUBOT_WECHAT_BOT_TOKEN, RUBOT_WECHAT_BASE_URL.
+{b}Config keys:{r}
+  {c}RUBOT_API_BASE_URL{r}, {c}RUBOT_API_KEY{r}, {c}RUBOT_MODEL{r}, {c}RUBOT_FAST_MODEL{r}
+  {c}RUBOT_TAVILY_API_KEY{r}, {c}RUBOT_WORKSPACE{r}, {c}RUBOT_MAX_RETRIES{r}
+  {c}RUBOT_CODE_EXEC_TIMEOUT{r}, {c}RUBOT_WECHAT_BOT_TOKEN{r}, {c}RUBOT_WECHAT_BASE_URL{r}
+  {d}Reads a global .env from the Rubot config directory.{r}
 ",
-        version = env!("CARGO_PKG_VERSION")
+        ver = env!("CARGO_PKG_VERSION"),
+        c = c, d = d, b = b, r = r
     );
 }
 
@@ -241,7 +263,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                 agent.lock().await.usage_summary()
             });
             print!("{}\r\n", hud);
-            (rl.readline("> "), false)
+            (rl.readline("❯ "), false)
         };
 
         match line {
@@ -256,7 +278,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                         "/quit" | "/exit" => {
                             rt.block_on(async { agent.lock().await.shutdown().await });
                             let _ = rl.save_history(&history_path);
-                            println!("bye.");
+                            println!("{}bye.{}", markdown::DIM, markdown::R);
                             return Ok(());
                         }
                         "/loop" => {
@@ -271,13 +293,15 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                     stop_condition = "done".into();
                                 }
                                 println!(
-                                    "{}[Loop ON | stop: {}]{}",
-                                    markdown::YELLOW,
-                                    stop_condition,
-                                    markdown::R
+                                    "{}┌─ LOOP ON ─────────────────────────────────────────┐{}\n\
+                                     {}│ stop: {}{}                                      │{}\n\
+                                     {}└──────────────────────────────────────────────────────┘{}",
+                                    markdown::YELLOW, markdown::R,
+                                    markdown::YELLOW, markdown::R, stop_condition, markdown::YELLOW,
+                                    markdown::YELLOW, markdown::R,
                                 );
                             } else {
-                                println!("{}[Loop OFF]{}", markdown::DIM, markdown::R);
+                                println!("{}┌─ LOOP OFF ────────────────────────────────────────┐{}\n{}└──────────────────────────────────────────────────────┘{}", markdown::DIM, markdown::R, markdown::DIM, markdown::R);
                             }
                             continue;
                         }
@@ -287,7 +311,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                             {
                                 Ok(()) => {}
                                 Err(e) => eprintln!(
-                                    "{}error:{} failed to clear conversation: {:#}",
+                                    "{}✗{} failed to clear conversation: {:#}",
                                     markdown::RED,
                                     markdown::R,
                                     e
@@ -332,20 +356,20 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                     match rt.block_on(async { agent.lock().await.memory().delete_entry(&arg).await }) {
                                         Ok(true) => println!("deleted {}", arg),
                                         Ok(false) => eprintln!("not found: {}", arg),
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                                 "clear" => {
                                     match rt.block_on(async { agent.lock().await.memory().clear_all().await }) {
                                         Ok(n) => println!("cleared {} memories", n),
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                                 "show" if !arg.is_empty() => {
                                     match rt.block_on(async { agent.lock().await.memory().get_entry(&arg).await }) {
                                         Ok(Some(t)) => println!("\n{}\n", markdown::render(&t)),
                                         Ok(None) => eprintln!("not found: {}", arg),
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                                 "due" => {
@@ -359,20 +383,20 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                             }
                                             println!("\n{}\n", markdown::render(&body));
                                         }
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                                 "review" if !arg.is_empty() => {
                                     match rt.block_on(async { agent.lock().await.memory().touch(&arg).await }) {
                                         Ok(true) => println!("reviewed {}", arg),
                                         Ok(false) => eprintln!("not found: {}", arg),
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                                 "decay" => {
                                     match rt.block_on(async { agent.lock().await.memory().decay().await }) {
                                         Ok(r) => println!("promoted {}, evicted {}", r.promoted, r.evicted),
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                                 "help" => println!("usage:\n  /memory              list index\n  /memory show <id>    show entry (auto-touch)\n  /memory <id>         shorthand for show\n  /memory search <q>   keyword search\n  /memory due          list entries past review window\n  /memory review <id>  touch entry (strength+=1)\n  /memory decay        sweep: promote / evict stale\n  /memory delete <id>  delete entry\n  /memory clear        wipe all"),
@@ -380,7 +404,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                     match rt.block_on(async { agent.lock().await.memory().get_entry(id).await }) {
                                         Ok(Some(t)) => println!("\n{}\n", markdown::render(&t)),
                                         Ok(None) => eprintln!("not found: {}", id),
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                             }
@@ -395,7 +419,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                         println!("model set to {}", parts[1]);
                                     }
                                     Err(e) => {
-                                        eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e)
+                                        eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e)
                                     }
                                 }
                             } else {
@@ -491,7 +515,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                                             }
                                                         }
                                                         Err(e) => eprintln!(
-                                                            "{}error:{} failed to apply config: {:#}",
+                                                            "{}✗{} failed to apply config: {:#}",
                                                             markdown::RED,
                                                             markdown::R,
                                                             e
@@ -499,7 +523,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                                     }
                                                 }
                                                 Err(e) => eprintln!(
-                                                    "{}error:{} failed to reload config: {:#}",
+                                                    "{}✗{} failed to reload config: {:#}",
                                                     markdown::RED,
                                                     markdown::R,
                                                     e
@@ -507,7 +531,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                             }
                                         }
                                         Err(e) => eprintln!(
-                                            "{}error:{} failed to save config: {:#}",
+                                            "{}✗{} failed to save config: {:#}",
                                             markdown::RED,
                                             markdown::R,
                                             e
@@ -684,7 +708,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                             agent.lock().await.process_with_skill(name, &run_args).await
                                         }) {
                                             Ok(resp) => println!("{}\n", markdown::render(&resp)),
-                                            Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                            Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                         }
                                     }
                                 }
@@ -698,7 +722,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                         }) {
                                             Ok(true) => println!("deleted skill {}", name),
                                             Ok(false) => eprintln!("skill not found: {}", name),
-                                            Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                            Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                         }
                                     }
                                 }
@@ -712,7 +736,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                                         agent.lock().await.process_with_skill(trigger, &arg).await
                                     }) {
                                         Ok(resp) => println!("{}\n", markdown::render(&resp)),
-                                        Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                                        Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                                     }
                                 }
                             }
@@ -741,7 +765,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                         if loop_mode {
                             if res.contains("TASK COMPLETE") || res.contains(&stop_condition) {
                                 loop_mode = false;
-                                println!("{}[Loop ended]{}", markdown::DIM, markdown::R);
+                                println!("{}┈ LOOP ended ┈{}", markdown::DIM, markdown::R);
                             } else {
                                 last_input = format!(
                                     "Continue. STOP: {}. End with 'TASK COMPLETE'.",
@@ -750,7 +774,7 @@ fn run_repl(agent: Arc<Mutex<agent::Agent>>) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Err(e) => eprintln!("{}error:{} {:#}", markdown::RED, markdown::R, e),
+                    Err(e) => eprintln!("{}✗{} {:#}", markdown::RED, markdown::R, e),
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
